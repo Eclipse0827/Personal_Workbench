@@ -1,0 +1,12 @@
+# 依赖包 (绝不要上传)
+node_modules/
+
+# 临时文件 (根据你的需要选择是否忽略)
+.tmp-初稿.txt
+.tmp-二稿.txt
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+data/
