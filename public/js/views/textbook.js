@@ -26,14 +26,6 @@ const ENGINE_LABEL = {
   real: '远程模型',
 };
 
-const SOURCE_LABEL = {
-  bookmarks: '章节来自 PDF 书签',
-  toc: '章节来自目录页识别',
-  ocr: '章节来自目录页 OCR 识别',
-  headings: '章节来自正文标题',
-  chunks: '没有识别到目录，按页分段',
-};
-
 const TEXT_SOURCE_LABEL = {
   pdf: 'PDF 文字层',
   ocr: '本机 Windows OCR',
@@ -41,8 +33,39 @@ const TEXT_SOURCE_LABEL = {
   none: '没有可用文字',
 };
 
+const BILIBILI_SEARCH = 'https://search.bilibili.com/all?keyword=';
+const XHS_SEARCH = 'https://www.xiaohongshu.com/search_result?keyword=';
+
 function engineLabel(provider) {
   return ENGINE_LABEL[provider] || '本地原文整理';
+}
+
+/**
+ * 把一句提问压成适合站内搜索的短句。
+ * 这里只做确定性的词面清理，不假装是模型「总结」；问题原文仍保留在对话里。
+ */
+const SEARCH_STOP_WORDS = /(请问|帮我|给我|我想|想知道|能不能|可不可以|可以|如何|怎么|怎样|为什么|到底|究竟|有什么|什么|哪些|哪个|多少|是否|什么是|是什么意思|什么意思|解释一下|解释|讲讲|说说|讲一遍|展开|一下|一个|这个|那个|这一节|本节|具体|应该|需要|是|的|了|吗|呢|啊|吧|和|与|及|在|中|对|把|被|让|给|这|那|它|我们|你|我)/g;
+
+function cleanSearchWords(text) {
+  return String(text || '')
+    .replace(/[？?！!。，,、；;：:（）()「」“”"']/g, ' ')
+    .replace(SEARCH_STOP_WORDS, ' ')
+    .replace(/\s+/g, ' ')
+    .split(' ')
+    .map((word) => word.replace(/^[是的有在和与及对把被让给]+|[是的有了吗呢啊吧]+$/g, ''))
+    .filter((word) => word.length >= 2)
+    .join(' ')
+    .trim();
+}
+
+export function studySearchQuery(question, sectionTitle) {
+  const core = cleanSearchWords(question);
+  const title = String(sectionTitle || '').trim();
+  const titleCore = cleanSearchWords(title);
+  const titleWords = titleCore.split(' ').filter((word) => word.length >= 3);
+  const titleCovered = titleWords.some((word) => core.includes(word));
+  const parts = titleCovered ? [core] : [title || titleCore, core];
+  return parts.filter(Boolean).join(' ').slice(0, 64).trim() || title.slice(0, 64);
 }
 
 function flattenSections(book) {
@@ -349,7 +372,6 @@ function renderMindMap(book, ctx) {
 
 function renderOverview(root, ctx, book) {
   const flat = flattenSections(book);
-  const guide = book.guide || null;
   const last = book.lastSectionId ? findSectionById(book, book.lastSectionId) : null;
   let shell = null;
 
@@ -382,37 +404,12 @@ function renderOverview(root, ctx, book) {
     }, '从第一节开始'));
   }
 
-  const guideCard = h('div.card.reader-guide', {}, [
-    h('div.reader-guide-head', {}, [
-      h('div', {}, [
-        h('div.focus-kicker', {}, '全书导览'),
-        h('h2', {}, '先看主线，再按节读'),
-      ]),
-      guide ? chip(engineLabel(guide.provider), { tone: guide.provider === 'local' ? '' : 'accent' }) : null,
-    ]),
-    guide && guide.overview
-      ? h('div.reader-guide-overview', {}, renderMarkdown(guide.overview))
-      : h('p.small.muted', {}, '这本书还没有导览文字，不影响按目录阅读。'),
-    guide && guide.studyPath && guide.studyPath.length
-      ? h('div.reader-guide-path', {}, [
-          h('div.reader-guide-sub', {}, '建议的阅读顺序'),
-          h('ol.reader-guide-steps', {}, guide.studyPath.map((x) => h('li', {}, x))),
-        ])
-      : null,
-    guide && guide.demoNote ? h('div.notice.quiet.mt2.mb0', {}, guide.demoNote) : null,
-    guide && guide.warning ? h('div.notice.warm.mt2.mb0', {}, guide.warning) : null,
-    book.ocrUsed
-      ? h('div.notice.quiet.mt2.mb0.reader-ocr-notice', {}, [
-          h('strong', {}, '正文由本机 Windows OCR 识别。'),
-          h('span', {}, '公式、符号和分栏可能失真，讲义不会硬凑看不清的公式；重要内容请对照 PDF 原页。'),
-        ])
-      : null,
-    h('div.tiny.muted.mt2', {}, [
-      `${SOURCE_LABEL[book.structureSource] || '章节框架已整理'}`,
-      ` · 文字来源：${TEXT_SOURCE_LABEL[book.textSource] || 'PDF 文字层'}`,
-      book.structureNote ? ` · ${book.structureNote}` : '',
-    ]),
-  ]);
+  const ocrNotice = book.ocrUsed
+    ? h('div.notice.quiet.reader-ocr-notice', {}, [
+        h('strong', {}, '正文由本机 Windows OCR 识别。'),
+        h('span', {}, '公式、符号和分栏可能失真，讲义不会硬凑看不清的公式；重要内容请对照 PDF 原页。'),
+      ])
+    : null;
 
   const resumeCard = last ? h('div.card.reader-resume', {}, [
     h('div.reader-resume-mark', {}, '↳'),
@@ -433,7 +430,7 @@ function renderOverview(root, ctx, book) {
     toc,
     h('div.reader-main.reader-overview-main', {}, [
       resumeCard,
-      guideCard,
+      ocrNotice,
       mindMap,
       terms,
     ]),
@@ -450,6 +447,96 @@ function renderOverview(root, ctx, book) {
     }),
     shell,
   ]));
+}
+
+// ================================================================ 章节知识地图
+
+function fallbackChapterMap(chapter) {
+  return {
+    provider: 'local',
+    overview: '',
+    thread: [],
+    note: '这一章还没有生成知识地图，先按小节标题阅读。',
+    nodes: (chapter.sections || []).map((section) => ({
+      sectionId: section.id,
+      title: section.title,
+      pages: `${section.pageStart}–${section.pageEnd}`,
+      points: (section.lesson && section.lesson.keyPoints || []).slice(0, 3)
+        .concat((section.subsections || []).slice(0, 3).map((x) => x.title))
+        .slice(0, 3),
+    })),
+  };
+}
+
+function chapterMapFor(book, chapter) {
+  const map = book.chapterGuides && book.chapterGuides[chapter.id];
+  return map && Array.isArray(map.nodes) ? map : fallbackChapterMap(chapter);
+}
+
+function renderChapterMap(book, chapter, activeSectionId, { onNavigate, open }) {
+  const map = chapterMapFor(book, chapter);
+  const chapterIndex = (book.chapters || []).findIndex((c) => c.id === chapter.id);
+  const nodes = map.nodes || [];
+  const pointCount = nodes.reduce((n, node) => n + (node.points || []).length, 0);
+  const first = (chapter.sections || [])[0];
+
+  const body = h('div.chapter-map-body', {}, [
+    map.overview ? h('p.chapter-map-overview', {}, map.overview) : null,
+    map.thread && map.thread.length
+      ? h('div.chapter-map-thread', {}, [
+          h('span.chapter-map-thread-label', {}, '本章主线'),
+          h('span', {}, map.thread.slice(0, 3).join('；')),
+        ])
+      : null,
+    h('div.chapter-map-layout', {}, [
+      h('div.chapter-map-root', {}, [
+        h('span.chapter-map-root-kicker', {}, 'CHAPTER'),
+        h('strong', {}, chapter.title),
+        h('span.chapter-map-root-meta', {},
+          `第 ${chapter.pageStart}–${chapter.pageEnd} 页 · ${nodes.length} 节`),
+        first
+          ? h('button.chapter-map-root-go', {
+              type: 'button',
+              onclick: () => onNavigate(first.id),
+            }, '从第一节开始 →')
+          : null,
+      ]),
+      h('div.chapter-map-branches', {}, nodes.map((node, i) => {
+        const active = node.sectionId === activeSectionId;
+        const points = node.points || [];
+        return h(`button.chapter-map-node${active ? '.active' : ''}`, {
+          type: 'button',
+          onclick: () => onNavigate(node.sectionId),
+          title: `进入「${node.title}」`,
+        }, [
+          h('span.chapter-map-node-head', {}, [
+            h('span.chapter-map-node-no', {}, String(i + 1).padStart(2, '0')),
+            h('span.chapter-map-node-title', {}, node.title),
+            h('span.chapter-map-node-pages', {}, node.pages),
+          ]),
+          points.length
+            ? h('ul.chapter-map-points', {}, points.map((point) => h('li', {}, point)))
+            : h('span.chapter-map-empty', {}, '这一节以原文图示为主'),
+          h('span.chapter-map-node-go', {}, active ? '正在读这一节' : '读这一节 →'),
+        ]);
+      })),
+    ]),
+    h('div.chapter-map-note', {}, [
+      map.note || '',
+      map.provider && map.provider !== 'local' ? ` · ${engineLabel(map.provider)}` : '',
+    ].join('')),
+  ]);
+
+  return h('details.chapter-map-card', { open: open || undefined }, [
+    h('summary.chapter-map-summary', {}, [
+      h('span.chapter-map-summary-main', {}, [
+        h('span.chapter-map-kicker', {}, `第 ${chapterIndex + 1} 章 · 本章知识地图`),
+        h('strong.chapter-map-summary-title', {}, chapter.title),
+      ]),
+      h('span.chapter-map-summary-meta', {}, `${nodes.length} 节 · ${pointCount} 个知识点`),
+    ]),
+    body,
+  ]);
 }
 
 // ================================================================ 单节阅读
@@ -717,18 +804,54 @@ function renderSection(root, ctx, book, hit, flat, index) {
       return;
     }
 
+    if (lesson.position) {
+      lessonHost.appendChild(h('div.reader-position', {}, [
+        h('span.reader-position-label', {}, '在整章里的位置'),
+        h('div.reader-position-text', {}, renderMarkdown(lesson.position)),
+      ]));
+    }
+
     if (lesson.overview) {
       lessonHost.appendChild(h('div.reader-lesson-overview', {}, renderMarkdown(lesson.overview)));
     }
 
-    if (lesson.keyPoints && lesson.keyPoints.length) {
-      lessonHost.appendChild(h('div.reader-lesson-section', {}, [
-        h('h4', {}, '这一节要抓住的几点'),
-        h('ul.reader-keypoints', {}, lesson.keyPoints.map((k) => h('li', {}, renderMarkdown(k)))),
+    const thread = Array.isArray(lesson.thread) ? lesson.thread : [];
+    if (thread.length) {
+      lessonHost.appendChild(h('div.reader-thread-block', {}, [
+        h('div.reader-thread-head', {}, [
+          h('span', {}, '顺着这条线读'),
+          h('span.count', {}, `${thread.length} 步`),
+        ]),
+        h('ol.reader-thread', {}, thread.map((step, i) => h('li.reader-thread-step', {}, [
+          h('span.reader-thread-no', {}, String(i + 1).padStart(2, '0')),
+          h('div.reader-thread-body', {}, [
+            h('h3.reader-thread-title', {}, step.title),
+            h('div.reader-thread-prose', {}, renderMarkdown(step.body)),
+          ]),
+        ]))),
       ]));
     }
 
+    const threadText = thread
+      .map((step) => `${step.title} ${step.body}`)
+      .join(' ')
+      .replace(/[^\u4e00-\u9fa5A-Za-z0-9]/g, '');
+    const extraKeyPoints = (lesson.keyPoints || []).filter((point) => {
+      const key = String(point || '').replace(/[^\u4e00-\u9fa5A-Za-z0-9]/g, '');
+      if (!key || key.length < 8 || !threadText) return Boolean(key);
+      const head = key.slice(0, Math.min(key.length, 14));
+      return !threadText.includes(head);
+    });
+    if (extraKeyPoints.length) {
+      lessonHost.appendChild(h('div.reader-lesson-section.reader-keypoint-block', {}, [
+        h('h4', {}, extraKeyPoints.length > 1 ? '读完要能说出这几句' : '再多记一句'),
+        h('ul.reader-keypoints', {}, extraKeyPoints.map((k) => h('li', {}, renderMarkdown(k)))),
+      ]));
+    }
+
+    const threadTitles = new Set(thread.map((step) => step.title));
     for (const block of lesson.blocks || []) {
+      if (block.heading && threadTitles.has(block.heading)) continue;
       lessonHost.appendChild(h('div.reader-lesson-section', {}, [
         block.heading ? h('h4', {}, block.heading) : null,
         h('div.reader-lesson-prose', {}, renderMarkdown(block.body)),
@@ -758,7 +881,7 @@ function renderSection(root, ctx, book, hit, flat, index) {
 
     if (lesson.questions && lesson.questions.length) {
       lessonHost.appendChild(h('div.reader-lesson-section', {}, [
-        h('h4', {}, '读完自测'),
+        h('h4', {}, '合上讲义，自测一下'),
         h('div.reader-question-list', {}, lesson.questions.map((q) => {
           const parts = splitQuestionLines(q);
           const textNode = h('span.reader-question-text', {}, parts.flatMap((part, i) =>
@@ -899,6 +1022,8 @@ function renderSection(root, ctx, book, hit, flat, index) {
   let sendError = null;
   let lastQuestion = '';
 
+  const diagramStates = new Map();
+
   const SUGGESTIONS = [
     '用更简单的话讲一遍这一节',
     '这一节最重要的概念是什么？',
@@ -922,7 +1047,80 @@ function renderSection(root, ctx, book, hit, flat, index) {
     });
   }
 
-  function chatMessageNode(msg) {
+  function diagramCard(diagram) {
+    return h('div.reader-diagram', {}, [
+      h('div.reader-diagram-head', {}, [
+        h('span.reader-diagram-kicker', {}, '图解'),
+        h('strong.reader-diagram-title', {}, diagram.title),
+      ]),
+      h('ol.reader-diagram-flow', {}, diagram.steps.map((step) =>
+        h('li.reader-diagram-step', {}, [
+          h('span.reader-diagram-label', {}, step.label),
+          step.detail ? h('span.reader-diagram-detail', {}, step.detail) : null,
+        ])
+      )),
+      diagram.note ? h('div.reader-diagram-note', {}, diagram.note) : null,
+      diagram.warning ? h('div.tiny.reader-msg-warning', {}, diagram.warning) : null,
+      h('div.reader-diagram-meta', {},
+        `${engineLabel(diagram.provider)}${diagram.model ? ` · ${diagram.model}` : ''}`),
+    ]);
+  }
+
+  async function loadDiagram(key, question) {
+    const current = diagramStates.get(key);
+    if (current && current.loading) return;
+    diagramStates.set(key, { loading: true });
+    paintChat();
+    try {
+      const res = await api.diagramTextbookSection(book.id, section.id, question || section.title);
+      if (!alive) return;
+      diagramStates.set(key, { data: res.diagram });
+    } catch (err) {
+      if (!alive) return;
+      diagramStates.set(key, { error: err.message || String(err) });
+    }
+    paintChat();
+  }
+
+  function assistantTools(msg, question, key) {
+    if (!msg.id) return null;
+    const query = studySearchQuery(question, section.title);
+    const biliQuery = `${query} 课程`.trim();
+    const xhsQuery = `${query} 学习笔记`.trim();
+    const state = diagramStates.get(key) || {};
+    const tools = h('div.reader-msg-tools', {}, [
+      h('button.reader-msg-tool', {
+        type: 'button',
+        disabled: Boolean(state.loading),
+        title: '把这个问题整理成一张流程图',
+        onclick: () => loadDiagram(key, question),
+      }, state.loading ? '正在图解…' : '✎ 图解一下'),
+      h('a.reader-msg-tool', {
+        href: `${BILIBILI_SEARCH}${encodeURIComponent(biliQuery)}`,
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        title: `在新标签打开 B 站搜索：${biliQuery}`,
+      }, 'B站找课 ↗'),
+      h('a.reader-msg-tool', {
+        href: `${XHS_SEARCH}${encodeURIComponent(xhsQuery)}`,
+        target: '_blank',
+        rel: 'noopener noreferrer',
+        title: `在新标签打开小红书搜索：${xhsQuery}`,
+      }, '小红书搜笔记 ↗'),
+    ]);
+
+    const extra = [];
+    if (state.loading) {
+      extra.push(h('div.reader-diagram-loading', {}, '正在把这个问题画成一步一步的流程图…'));
+    } else if (state.error) {
+      extra.push(h('div.reader-diagram-error', {}, `图解没有生成：${state.error}`));
+    } else if (state.data) {
+      extra.push(diagramCard(state.data));
+    }
+    return h('div.reader-msg-tools-wrap', {}, [tools, ...extra]);
+  }
+
+  function chatMessageNode(msg, question = '', key = '') {
     if (msg.role === 'user') {
       return h('div.reader-msg.user', {}, [
         h('div.reader-msg-bubble', {}, String(msg.content || '')),
@@ -935,6 +1133,7 @@ function renderSection(root, ctx, book, hit, flat, index) {
       ]),
       h('div.reader-msg-bubble', {}, renderMarkdown(msg.content)),
       msg.warning ? h('div.tiny.reader-msg-warning', {}, msg.warning) : null,
+      assistantTools(msg, question, key),
     ]);
   }
 
@@ -947,7 +1146,12 @@ function renderSection(root, ctx, book, hit, flat, index) {
         h('div.tiny.muted', {}, '问题只会带上这一节相关的原文，不会把整本书发出去。'),
       ]));
     }
-    for (const msg of chatMessages) chatList.appendChild(chatMessageNode(msg));
+    let promptQuestion = '';
+    chatMessages.forEach((msg, i) => {
+      if (msg.role === 'user') promptQuestion = String(msg.content || '');
+      const key = msg.role === 'assistant' ? (msg.id || `assistant-${i}`) : '';
+      chatList.appendChild(chatMessageNode(msg, promptQuestion, key));
+    });
     if (sending) {
       chatList.appendChild(h('div.reader-msg.assistant', {}, [
         h('div.reader-msg-meta', {}, [h('span.reader-msg-engine', {}, engineLabel(aiProvider === 'mock' ? 'local' : aiProvider))]),
@@ -1056,14 +1260,19 @@ function renderSection(root, ctx, book, hit, flat, index) {
 
   // ---------------------------------------------------------------- 组装
 
+  const chapterMap = renderChapterMap(book, chapter, section.id, {
+    onNavigate: go,
+    open: Boolean(((chapter.sections || [])[0] || {}).id === section.id),
+  });
+
   shell = h('div.reader-shell', {}, [
     toc,
     h('div.reader-main.reader-section-main', {}, [
+      chapterMap,
       h('div.card.reader-lesson-card', {}, [
         h('div.reader-lesson-head', {}, [
           h('div', {}, [
-            h('div.focus-kicker', {}, chapter.title),
-            h('h2', {}, section.title),
+            h('div.focus-kicker', {}, '本节精读'),
             h('div.reader-lesson-sub', {}, [
               `第 ${section.pageStart}–${section.pageEnd} 页`,
               section.wholeChapter ? ' · 整章作为一个阅读单元' : '',

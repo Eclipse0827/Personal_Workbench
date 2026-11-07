@@ -4,41 +4,24 @@
  * PRD 2.2 要求的五个模块，全部保留：
  *   A. 欢迎区域（日期 + 问候，不用连续打卡施压）
  *   B. 今日计划（未完成 / 已完成 / 快速新增 / 查看全部未完成 / 直接改状态 / 多时先展示部分）
- *   C. AI 快速入口（自然语言输入 + 四个快捷入口）
+ *   C. AI 快速入口（「和 AI 聊会」直达）
  *   D. 最近计划
- *   E. 工具入口（未实现标「规划中」，不许进入无效页面）
  *
  * 版式按参考设计组织：一张「今日」大卡（三栏 + 竖分隔线）、
- * 一张大数字进度卡、一张计划卡，然后是 AI 入口与工具。
+ * 一张大数字进度卡、一张计划卡。工具统一放在左侧栏。
  * 主角是今日任务，AI 入口在旁边 —— 对应 PRD 1.4「工作台优先，AI 辅助」。
  */
 
 import { api } from '../api.js';
 import {
-  h, toast, toastError, taskRow, emptyState, pageHead, chip, iconButton,
-  todayLabel, greeting, fmtDay, fmtDateTime, fmtRelative, truncate,
-  PROVIDER_LABEL,
+  h, toast, toastError, pageHead,
+  todayLabel, greeting, fmtDay, fmtRelative, truncate,
 } from '../ui.js';
-import { state, todayOpen, todayDone, allOpen, isOverdue, planById } from '../state.js';
+import { state, todayOpen, todayDone, isOverdue } from '../state.js';
 import { openTaskForm, openPlanForm } from './task-form.js';
 
 /** 今日计划最多先展示几条，其余折叠 */
 const TODAY_PREVIEW = 6;
-
-const QUICK_STARTS = [
-  { label: '我想理清一件事', text: '我想理清一件事：' },
-  { label: '我最近有些焦虑', text: '我最近有些焦虑，' },
-  { label: '帮我规划接下来的学习', text: '帮我规划接下来的学习。' },
-  { label: '我已经知道要做什么，帮我拆成小任务', text: '我已经知道要做什么了，帮我拆成小任务：' },
-];
-
-const TOOLS = [
-  { id: 'thought', label: '思考档案', desc: '已经保存的思考与摘要', state: 'ready', to: '/archive' },
-  { id: 'pdf', label: '教材精读', desc: '导入 PDF，按节读讲义、问 AI', state: 'ready', to: '/textbooks' },
-  { id: 'outline', label: '章节知识框架', desc: '自动整理章节的知识结构', state: 'planned' },
-  { id: 'quiz', label: '习题生成', desc: '按章节生成练习题', state: 'planned' },
-  { id: 'mistakes', label: '错题整理', desc: '收集错题并归类复习', state: 'planned' },
-];
 
 /** 中文的「10月20日 星期二」 */
 function monthDayWeek() {
@@ -73,27 +56,6 @@ export default async function renderDashboard(root, ctx) {
   }
 
   const editTask = (task) => openTaskForm({ task, plans, onSaved: () => ctx.rerender() });
-
-  // ---------------------------------------------------------------- 引擎状态
-
-  function engineChip() {
-    const ai = state.ai || {};
-    const provider = (state.settings && state.settings.aiProvider) || ai.provider || 'mock';
-    if (provider === 'ollama') {
-      const online = ai.ollama && ai.ollama.online;
-      const model = (ai.ollama && ai.ollama.selected) || ai.model || '未选择模型';
-      return online
-        ? chip(`Ollama · ${truncate(model, 22)}`, { tone: 'accent', title: `本地模型在线：${model}` })
-        : chip('Ollama 未连接', { tone: 'warm', title: (ai.ollama && ai.ollama.error) || '连不上本地 Ollama 服务' });
-    }
-    if (provider === 'real') {
-      const configured = state.settings && state.settings.hasApiKey;
-      return configured
-        ? chip(`远程 · ${truncate(ai.model || '模型', 18)}`, { title: '使用远程模型生成回复' })
-        : chip('远程模型未配置', { tone: 'warm', title: '还没有填 API Key' });
-    }
-    return chip(PROVIDER_LABEL.mock, { title: '离线规则引擎，不联网' });
-  }
 
   // ---------------------------------------------------------------- 今日大卡
 
@@ -254,98 +216,6 @@ export default async function renderDashboard(root, ctx) {
     ]);
   }
 
-  // ---------------------------------------------------------------- AI 入口
-
-  const aiInput = h('textarea', {
-    rows: 3,
-    placeholder: '现在在想什么？直接写下来就行，不用组织语言。\n\n例如：我最近很焦虑考研，不知道怎么开始，学校还没选好。',
-    onkeydown: (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') submit();
-    },
-  });
-
-  let busy = false;
-  const sendBtn = h('button.btn.primary', { onclick: () => submit() }, '和 AI 聊聊');
-
-  async function submit() {
-    const text = aiInput.value.trim();
-    if (!text) {
-      toast('写一句就行，哪怕只有几个字。', 'warn');
-      aiInput.focus();
-      return;
-    }
-    if (busy) return;
-    busy = true;
-    sendBtn.disabled = true;
-    sendBtn.textContent = '正在打开…';
-    try {
-      const conv = await api.createConversation({});
-      await api.sendMessage(conv.id, text);
-      ctx.navigate(`/chat/${conv.id}`);
-    } catch (err) {
-      toastError(err);
-      busy = false;
-      sendBtn.disabled = false;
-      sendBtn.textContent = '和 AI 聊聊';
-    }
-  }
-
-  function aiCard() {
-    const provider = (state.settings && state.settings.aiProvider) || 'mock';
-    const label = PROVIDER_LABEL[provider] || PROVIDER_LABEL.mock;
-    return h('div.card.ai-entry', {}, [
-      h('div.ai-entry-head', {}, [
-        h('h3', {}, '遇到问题了？直接说'),
-        h(`span.badge-${provider === 'real' ? 'real' : provider === 'ollama' ? 'ollama' : 'mock'}`,
-          { title: '当前使用的引擎' }, label),
-      ]),
-      h('p.small.muted', {}, '不用先选情绪类型，也不用填表。说完之后会整理成一个可以改的梳理结果；需要的话，再帮你拆成具体的行动。'),
-      aiInput,
-      h('div.quick-starts', {}, QUICK_STARTS.map((q) =>
-        h('button.quick-chip', {
-          type: 'button',
-          onclick: () => {
-            aiInput.value = q.text;
-            aiInput.focus();
-            aiInput.setSelectionRange(q.text.length, q.text.length);
-          },
-        }, q.label)
-      )),
-      h('div.btn-row.mt2', {}, [
-        sendBtn,
-        h('button.btn.ghost', { onclick: () => ctx.navigate('/chat') }, '以前的对话'),
-      ]),
-      h('div.tiny.muted.mt1', {}, '写完按 Ctrl + Enter 可以直接发送。'),
-    ]);
-  }
-
-  // ---------------------------------------------------------------- 工具
-
-  function toolsCard() {
-    return h('div.card', {}, [
-      h('div.section-head.inline', {}, [
-        h('h2', {}, '我的工具'),
-        h('button.btn.small.ghost', {
-          style: { marginLeft: 'auto' },
-          onclick: () => ctx.navigate('/tools'),
-        }, '全部工具 →'),
-      ]),
-      h('div.tool-grid', {}, TOOLS.map((t) =>
-        h(`button.tool-tile${t.state === 'planned' ? '.planned' : ''}`, {
-          type: 'button',
-          onclick: () => {
-            if (t.state === 'ready') ctx.navigate(t.to);
-            else toast('这个工具还在规划中，暂时打不开。', 'warn');
-          },
-        }, [
-          h('div.tool-name', {}, t.label),
-          h('div.tool-desc', {}, t.desc),
-          h('div.tool-state', {}, t.state === 'ready' ? '可用' : '规划中'),
-        ])
-      )),
-    ]);
-  }
-
   // ---------------------------------------------------------------- 组装
 
   root.appendChild(
@@ -354,7 +224,15 @@ export default async function renderDashboard(root, ctx) {
         title: '概览',
         sub: `${todayLabel()} · ${greeting()}`,
         actions: [
-          engineChip(),
+          h('button.ai-portal', {
+            type: 'button',
+            title: '打开 AI 整理空间，把卡住的事说出来',
+            onclick: () => ctx.navigate('/chat'),
+          }, [
+            h('span.dot'),
+            '和 AI 聊会',
+            h('span.arrow', {}, '→'),
+          ]),
           h('button.btn.primary', { onclick: quickAdd }, '＋ 新增任务'),
         ],
       }),
@@ -366,13 +244,9 @@ export default async function renderDashboard(root, ctx) {
         planCard(),
       ]),
 
-      h('div.section.mt3', {}, [aiCard()]),
-
-      h('div.section', {}, [toolsCard()]),
-
       h('div.center.mt3', {}, [
         h('div.tiny.muted', {}, [
-          `共 ${stats.total || 0} 个任务 · ${stats.done || 0} 个已完成 · ${stats.archives || 0} 份档案`,
+          `共 ${stats.total || 0} 个任务 · ${stats.done || 0} 个已完成`,
         ]),
       ]),
     ])

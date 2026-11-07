@@ -10,6 +10,12 @@ const root = document.getElementById('float-root');
 const toastEl = document.getElementById('float-toast');
 const desktop = window.desktopFloat || null;
 
+const TASK_MINUTES_KEY = 'huan-float-task-minutes-v1';
+const DEFAULT_MINUTES = 25;
+const QUICK_MINUTES = [15, 25, 45];
+const MIN_MINUTES = 1;
+const MAX_MINUTES = 180;
+
 const state = {
   status: 'loading', // loading | ready | error
   error: '',
@@ -20,6 +26,10 @@ const state = {
   busy: false,
   confirmCancel: false,
   pinned: true,
+  snapEnabled: false,
+  collapsed: false,
+  pickerTaskId: null,
+  taskMinutes: {},
   metaAt: 0,
   draft: '',
 };
@@ -34,8 +44,34 @@ let initialLoading = false;
 let loopsStarted = false;
 let lastHeight = 0;
 let addingTask = false;
+let ballDrag = null;
 
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
+
+// ---------------------------------------------------------------- 时长偏好
+
+function loadTaskMinutes() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(TASK_MINUTES_KEY) || '{}');
+    if (!raw || typeof raw !== 'object') return;
+    for (const [id, value] of Object.entries(raw)) {
+      const n = Math.round(Number(value));
+      if (Number.isFinite(n) && n >= MIN_MINUTES && n <= MAX_MINUTES) state.taskMinutes[id] = n;
+    }
+  } catch { /* 存不了就用默认时长 */ }
+}
+
+function minutesFor(task) {
+  const n = Number(state.taskMinutes[task.id]);
+  return Number.isFinite(n) && n >= MIN_MINUTES && n <= MAX_MINUTES ? Math.round(n) : DEFAULT_MINUTES;
+}
+
+function rememberMinutes(taskId, minutes) {
+  state.taskMinutes[taskId] = minutes;
+  try {
+    localStorage.setItem(TASK_MINUTES_KEY, JSON.stringify(state.taskMinutes));
+  } catch { /* 记不住偏好不影响本次计时 */ }
+}
 
 // ---------------------------------------------------------------- 基础
 
@@ -108,7 +144,7 @@ async function request(method, url, body) {
 }
 
 function toast(message, kind = '') {
-  if (!toastEl) return;
+  if (!toastEl || state.collapsed) return;
   toastEl.textContent = message;
   toastEl.className = `float-toast${kind ? ` ${kind}` : ''}`;
   void toastEl.offsetWidth;
@@ -130,6 +166,13 @@ function formatClock(ms) {
   const s = total % 60;
   if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function formatBallClock(ms) {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
 }
 
 function endClock(active) {
@@ -186,6 +229,13 @@ function sameToken(result, token) {
 
 function render() {
   if (!root) return;
+  if (state.collapsed) {
+    root.className = 'float-root ball-mode';
+    root.replaceChildren(renderBall());
+    return;
+  }
+  root.className = 'float-root';
+
   const scroller = root.querySelector('.float-scroll');
   const scrollTop = scroller ? scroller.scrollTop : 0;
 
@@ -196,6 +246,38 @@ function render() {
   if (nextScroller) nextScroller.scrollTop = scrollTop;
 
   applyWindowHeight();
+}
+
+function renderBall() {
+  const active = state.active;
+  const paused = Boolean(active && active.pausedAt);
+  const left = active ? remainingOf(active) : 0;
+  const total = Math.max(1, Number((active && active.minutes) || DEFAULT_MINUTES) * 60000);
+  const pct = active ? Math.min(100, Math.max(0, 100 * (1 - left / total))) : 0;
+  const modeLabel = active
+    ? (paused ? '已暂停' : (active.mode === 'break' ? '休息' : '专注'))
+    : (state.offline ? '未连接' : '点开');
+
+  const ball = el('div', {
+    class: `float-ball${paused ? ' paused' : ''}${state.offline ? ' offline' : ''}`,
+    title: active ? '专注中 · 点击展开，拖动可移动' : '点击展开，拖动可移动',
+    onpointerdown: onBallPointerDown,
+    onpointermove: onBallPointerMove,
+    onpointerup: onBallPointerUp,
+    onpointercancel: onBallPointerUp,
+  }, [
+    el('div.float-ball-inner', {}, active
+      ? [
+          el('div.float-ball-clock', { id: 'float-ball-clock' }, formatBallClock(left)),
+          el('div.float-ball-label', {}, modeLabel),
+        ]
+      : [
+          el('div.float-ball-mark', {}, '缓'),
+          el('div.float-ball-label', {}, modeLabel),
+        ]),
+  ]);
+  ball.style.setProperty('--pct', String(pct));
+  return ball;
 }
 
 function renderCard() {
@@ -227,7 +309,14 @@ function renderCard() {
 function renderHead() {
   const tools = [];
   if (desktop) {
-    tools.push(el('button.float-tool', {
+    tools.push(el('button', {
+      type: 'button',
+      class: `float-tool${state.snapEnabled ? ' active' : ''}`,
+      title: state.snapEnabled ? '收成悬浮球（吸边）' : '吸边：收成桌面悬浮球',
+      'aria-label': state.snapEnabled ? '收成悬浮球' : '开启吸边',
+      onclick: () => setSnap(true),
+    }, '吸'));
+    tools.push(el('button', {
       type: 'button',
       class: `float-tool${state.pinned ? ' active' : ''}`,
       title: state.pinned ? '取消置顶' : '保持在其他窗口之上',
@@ -289,7 +378,7 @@ function renderIdle() {
         ]),
     el('div.float-quick', {}, [
       el('div.label', {}, '不关联待办，直接开始'),
-      el('div.float-chips', {}, [15, 25, 45].map((m) => el('button.float-chip', {
+      el('div.float-chips', {}, QUICK_MINUTES.map((m) => el('button.float-chip', {
         type: 'button',
         disabled: state.busy,
         onclick: () => startFocus({ minutes: m }),
@@ -329,12 +418,15 @@ function renderAddTask() {
 
 function renderTask(task) {
   const overdue = task.dueDate && task.dueDate < todayStr();
+  const minutes = minutesFor(task);
   let meta = '';
   if (task.dueDate) meta = overdue ? `已过截止（${fmtDue(task.dueDate)}）` : `截止 ${fmtDue(task.dueDate)}`;
   else if (task.scheduledDate) meta = `安排 ${fmtDue(task.scheduledDate)}`;
   if (task.priority === 'important') meta = meta ? `${meta} · 重要` : '重要';
 
-  return el('div.float-task', {}, [
+  const open = state.pickerTaskId === task.id;
+
+  const row = el('div.float-task', {}, [
     el('button.float-check', {
       type: 'button',
       title: '勾选完成',
@@ -346,20 +438,90 @@ function renderTask(task) {
       el('div.float-task-title', { title: task.title }, task.title),
       meta ? el('div.float-task-meta', {}, overdue ? [el('span.warn', {}, meta)] : meta) : null,
     ]),
+    el('button.float-task-min', {
+      type: 'button',
+      title: `设置这条待办的专注时长（当前 ${minutes} 分钟）`,
+      'aria-label': `设置「${task.title}」的专注时长`,
+      disabled: state.busy,
+      onclick: () => togglePicker(task),
+    }, `${minutes}′`),
     el('button.float-start', {
       type: 'button',
-      title: `以「${task.title}」开始 25 分钟专注`,
+      title: `以「${task.title}」开始 ${minutes} 分钟专注`,
       disabled: state.busy,
-      onclick: () => startFocus({ task, minutes: 25 }),
+      onclick: () => startFocus({ task, minutes }),
     }, '开始'),
   ]);
+
+  return el('div.float-task-item', {}, [row, open ? renderPicker(task) : null]);
+}
+
+function togglePicker(task) {
+  state.pickerTaskId = state.pickerTaskId === task.id ? null : task.id;
+  render();
+  if (state.pickerTaskId) {
+    const input = document.getElementById('float-task-minutes');
+    input?.focus();
+    input?.select();
+  }
+}
+
+function renderPicker(task) {
+  const minutes = minutesFor(task);
+  return el('div.float-task-picker', {}, [
+    el('span.float-picker-label', {}, '专注'),
+    ...QUICK_MINUTES.map((m) => el('button.float-min-chip', {
+      type: 'button',
+      title: `立即开始 ${m} 分钟`,
+      disabled: state.busy,
+      onclick: () => startTaskWith(task, m),
+    }, `${m}′`)),
+    el('input.float-min-input', {
+      id: 'float-task-minutes',
+      type: 'number',
+      min: String(MIN_MINUTES),
+      max: String(MAX_MINUTES),
+      step: '1',
+      value: String(minutes),
+      'aria-label': `「${task.title}」的专注分钟数`,
+      onkeydown: (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        startFromPicker(task);
+      },
+    }),
+    el('span.float-picker-unit', {}, '分'),
+    el('button.float-min-go', {
+      type: 'button',
+      disabled: state.busy,
+      onclick: () => startFromPicker(task),
+    }, '开始'),
+  ]);
+}
+
+function startFromPicker(task) {
+  const input = document.getElementById('float-task-minutes');
+  const n = Math.round(Number(input ? input.value : NaN));
+  if (!Number.isFinite(n) || n < MIN_MINUTES || n > MAX_MINUTES) {
+    toast(`分钟数要在 ${MIN_MINUTES}–${MAX_MINUTES} 之间`);
+    input?.focus();
+    return;
+  }
+  startTaskWith(task, n);
+}
+
+function startTaskWith(task, minutes) {
+  const n = Math.max(MIN_MINUTES, Math.min(MAX_MINUTES, Math.round(Number(minutes) || DEFAULT_MINUTES)));
+  rememberMinutes(task.id, n);
+  state.pickerTaskId = null;
+  startFocus({ task, minutes: n });
 }
 
 function renderTimer() {
   const active = state.active;
   const paused = Boolean(active.pausedAt);
   const left = remainingOf(active);
-  const total = Math.max(1, Number(active.minutes || 25) * 60000);
+  const total = Math.max(1, Number(active.minutes || DEFAULT_MINUTES) * 60000);
   const pct = Math.min(100, Math.max(0, 100 * (1 - left / total)));
   const modeLabel = active.mode === 'break' ? '休息' : '专注';
 
@@ -403,7 +565,13 @@ function renderFoot() {
     el('span', {}, state.todayMinutes > 0
       ? ['今天已专注 ', el('strong', {}, `${state.todayMinutes} 分钟`)]
       : '今天还没有专注记录'),
-    el('span', {}, '与网页版同步'),
+    state.snapEnabled
+      ? el('button.float-foot-link', {
+          type: 'button',
+          title: '展开浮窗并关闭吸边',
+          onclick: () => setSnap(false),
+        }, '吸边中 · 取消')
+      : el('span', {}, '与网页版同步'),
   ]);
 }
 
@@ -411,13 +579,18 @@ function syncClock() {
   const active = state.active;
   if (!active) return;
   const left = remainingOf(active);
-  const total = Math.max(1, Number(active.minutes || 25) * 60000);
+  const total = Math.max(1, Number(active.minutes || DEFAULT_MINUTES) * 60000);
   const pct = Math.min(100, Math.max(0, 100 * (1 - left / total)));
 
   const clock = document.getElementById('float-clock');
   if (clock) clock.textContent = formatClock(left);
   const bar = document.getElementById('float-progress');
   if (bar) bar.style.width = `${pct}%`;
+
+  const ballClock = document.getElementById('float-ball-clock');
+  if (ballClock) ballClock.textContent = formatBallClock(left);
+  const ball = root ? root.querySelector('.float-ball') : null;
+  if (ball) ball.style.setProperty('--pct', String(pct));
 
   if (left <= 0 && !active.pausedAt && !expiring && !polling && !state.busy) {
     expiring = true;
@@ -426,7 +599,7 @@ function syncClock() {
 }
 
 function applyWindowHeight() {
-  if (!desktop || typeof desktop.resize !== 'function') return;
+  if (!desktop || typeof desktop.resize !== 'function' || state.collapsed) return;
   const height = state.status === 'ready' ? (state.active ? 360 : 500) : 320;
   if (height === lastHeight) return;
   lastHeight = height;
@@ -515,7 +688,7 @@ async function poll() {
 
 // ---------------------------------------------------------------- 操作
 
-async function startFocus({ task = null, minutes = 25 } = {}) {
+async function startFocus({ task = null, minutes = DEFAULT_MINUTES } = {}) {
   if (state.busy) return;
   if (state.active) {
     toast('已经有一轮在进行中了');
@@ -665,6 +838,7 @@ async function submitNewTask() {
       state.metaAt = Date.now();
     }
     state.draft = '';
+    state.pickerTaskId = null;
     toast('待办加好了');
     render();
     document.getElementById('float-new-task')?.focus();
@@ -703,6 +877,65 @@ async function togglePin() {
     toast('置顶切换失败', 'warn');
   }
   render();
+}
+
+async function setSnap(enabled) {
+  if (!desktop || typeof desktop.setSnap !== 'function') return;
+  try {
+    const data = await desktop.setSnap(enabled);
+    if (data) {
+      if (typeof data.snapEnabled === 'boolean') state.snapEnabled = data.snapEnabled;
+      if (typeof data.collapsed === 'boolean') state.collapsed = data.collapsed;
+    }
+  } catch {
+    toast('吸边切换失败', 'warn');
+    return;
+  }
+  render();
+}
+
+async function expandFloat() {
+  if (!desktop || typeof desktop.expand !== 'function') return;
+  try {
+    const data = await desktop.expand();
+    if (data) {
+      if (typeof data.snapEnabled === 'boolean') state.snapEnabled = data.snapEnabled;
+      if (typeof data.collapsed === 'boolean') state.collapsed = data.collapsed;
+    }
+  } catch {
+    return;
+  }
+  render();
+  poll();
+}
+
+// 悬浮球拖动：用指针的屏幕坐标交给主进程挪窗口；
+// 松手时如果几乎没动，就当成一次点击，展开浮窗。
+function onBallPointerDown(e) {
+  if (e.button !== 0 || !desktop || typeof desktop.dragStart !== 'function') return;
+  e.preventDefault();
+  ballDrag = { x: e.screenX, y: e.screenY, moved: false, pointerId: e.pointerId };
+  try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* 指针捕获失败也能拖动 */ }
+  try { desktop.dragStart(e.screenX, e.screenY); } catch { /* 没有桌面能力时忽略 */ }
+}
+
+function onBallPointerMove(e) {
+  if (!ballDrag || ballDrag.pointerId !== e.pointerId) return;
+  if (Math.hypot(e.screenX - ballDrag.x, e.screenY - ballDrag.y) > 3) ballDrag.moved = true;
+  if (ballDrag.moved && typeof desktop.dragMove === 'function') {
+    try { desktop.dragMove(e.screenX, e.screenY); } catch { /* 移动失败就停在原地 */ }
+  }
+}
+
+function onBallPointerUp(e) {
+  if (!ballDrag || ballDrag.pointerId !== e.pointerId) return;
+  const moved = ballDrag.moved;
+  ballDrag = null;
+  try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* 忽略 */ }
+  if (typeof desktop.dragEnd === 'function') {
+    try { desktop.dragEnd(); } catch { /* 忽略 */ }
+  }
+  if (!moved) expandFloat();
 }
 
 // ---------------------------------------------------------------- 启动
@@ -753,13 +986,31 @@ async function retry() {
 function bindDesktop() {
   if (!desktop || typeof desktop.info !== 'function') return;
   desktop.info().then((data) => {
-    if (data && typeof data.pinned === 'boolean') {
-      state.pinned = data.pinned;
-      render();
-    }
+    if (!data) return;
+    applyWindowState(data);
+    render();
   }).catch(() => { /* 拿不到就用默认值 */ });
+
+  if (typeof desktop.onState === 'function') {
+    desktop.onState((data) => {
+      if (!data) return;
+      if (applyWindowState(data)) render();
+    });
+  }
 }
 
+function applyWindowState(data) {
+  let changed = false;
+  for (const key of ['pinned', 'snapEnabled', 'collapsed']) {
+    if (typeof data[key] === 'boolean' && state[key] !== data[key]) {
+      state[key] = data[key];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+loadTaskMinutes();
 bindDesktop();
 render();
 loadInitial().finally(startLoops);

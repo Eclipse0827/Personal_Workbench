@@ -1,9 +1,9 @@
 /**
  * 桌面浮窗外壳。
  *
- * 它只做四件事：开一个透明、无边框、置顶的小窗口；加载 /float.html；
- * 把「收起 / 关闭 / 打开网页版 / 置顶」几个窗口级操作转给页面；
- * 记住窗口位置。业务数据全部走本地服务，浮窗和网页看到的是同一份。
+ * 它只做几件事：开一个透明、无边框、置顶的小窗口；加载 /float.html；
+ * 把「收起 / 关闭 / 打开网页版 / 置顶 / 吸边」几个窗口级操作转给页面；
+ * 记住窗口位置和吸边偏好。业务数据全部走本地服务，浮窗和网页看到的是同一份。
  */
 
 const fs = require('fs');
@@ -47,9 +47,39 @@ if (!app.requestSingleInstanceLock()) {
 
 let win = null;
 let pinned = true;
+let snapEnabled = false;
+let collapsed = false;
+let expandedBounds = null;
+let dragOffset = null;
+
+const BALL_SIZE = 112;
+const BALL_MARGIN = 10;
 
 function boundsFile() {
   return path.join(app.getPath('userData'), 'float-bounds.json');
+}
+
+function ballFile() {
+  return path.join(app.getPath('userData'), 'float-ball.json');
+}
+
+function prefsFile() {
+  return path.join(app.getPath('userData'), 'float-prefs.json');
+}
+
+function loadPrefs() {
+  try {
+    const p = JSON.parse(fs.readFileSync(prefsFile(), 'utf8'));
+    snapEnabled = Boolean(p && p.snapEnabled);
+  } catch {
+    snapEnabled = false;
+  }
+}
+
+function savePrefs() {
+  try {
+    fs.writeFileSync(prefsFile(), JSON.stringify({ snapEnabled }));
+  } catch { /* 记不住偏好不影响使用 */ }
 }
 
 function loadBounds() {
@@ -70,10 +100,128 @@ function loadBounds() {
 }
 
 function saveBounds() {
-  if (!win || win.isDestroyed()) return;
+  if (!win || win.isDestroyed() || collapsed) return;
   try {
     fs.writeFileSync(boundsFile(), JSON.stringify(win.getBounds()));
   } catch { /* 记不住位置不影响使用 */ }
+}
+
+function loadBallPosition() {
+  try {
+    const b = JSON.parse(fs.readFileSync(ballFile(), 'utf8'));
+    if (!Number.isFinite(b.x) || !Number.isFinite(b.y)) return null;
+    return clampBall(b.x, b.y);
+  } catch {
+    return null;
+  }
+}
+
+function saveBallPosition() {
+  if (!win || win.isDestroyed() || !collapsed) return;
+  try {
+    const [x, y] = win.getPosition();
+    fs.writeFileSync(ballFile(), JSON.stringify({ x, y }));
+  } catch { /* 记不住位置不影响使用 */ }
+}
+
+function clampBall(x, y) {
+  const b = { x: Math.round(x), y: Math.round(y), width: BALL_SIZE, height: BALL_SIZE };
+  const area = screen.getDisplayMatching(b).workArea;
+  return {
+    x: Math.max(area.x, Math.min(area.x + area.width - BALL_SIZE, b.x)),
+    y: Math.max(area.y, Math.min(area.y + area.height - BALL_SIZE, b.y)),
+  };
+}
+
+// 吸边：按小球中心落在屏幕哪半边，贴到左或右，纵向保持当前位置。
+function snapPosition(bounds) {
+  const area = screen.getDisplayMatching(bounds).workArea;
+  const centerX = bounds.x + bounds.width / 2;
+  const right = centerX >= area.x + area.width / 2;
+  const x = right
+    ? area.x + area.width - BALL_SIZE - BALL_MARGIN
+    : area.x + BALL_MARGIN;
+  const y = Math.max(
+    area.y + BALL_MARGIN,
+    Math.min(
+      area.y + area.height - BALL_SIZE - BALL_MARGIN,
+      Math.round(bounds.y + bounds.height / 2 - BALL_SIZE / 2),
+    ),
+  );
+  return { x, y };
+}
+
+function defaultBounds() {
+  const area = screen.getPrimaryDisplay().workArea;
+  const width = 360;
+  const height = 500;
+  return {
+    width,
+    height,
+    x: area.x + area.width - width - 24,
+    y: area.y + Math.max(24, Math.round((area.height - height) / 2)),
+  };
+}
+
+function collapseToBall() {
+  if (!win || win.isDestroyed()) return { collapsed, snapEnabled };
+  if (collapsed) return { collapsed, snapEnabled };
+
+  expandedBounds = win.getBounds();
+  saveBounds();
+
+  const pos = snapPosition(expandedBounds);
+  collapsed = true;
+  win.setMinimumSize(80, 80);
+  win.setBounds({ x: pos.x, y: pos.y, width: BALL_SIZE, height: BALL_SIZE }, false);
+  win.setResizable(false);
+  saveBallPosition();
+  return { collapsed, snapEnabled };
+}
+
+function positionWithinDisplay(b) {
+  const area = screen.getDisplayMatching(b).workArea;
+  const width = Math.max(300, Math.min(640, Math.round(b.width)));
+  const height = Math.max(240, Math.min(760, Math.round(b.height)));
+  return {
+    width,
+    height,
+    x: Math.max(area.x, Math.min(area.x + area.width - width, Math.round(b.x))),
+    y: Math.max(area.y, Math.min(area.y + area.height - height, Math.round(b.y))),
+  };
+}
+
+function expandWindow() {
+  if (!win || win.isDestroyed()) return { collapsed, snapEnabled };
+  if (!collapsed) {
+    if (!win.isVisible()) win.show();
+    win.focus();
+    return { collapsed, snapEnabled };
+  }
+
+  const target = positionWithinDisplay(expandedBounds || defaultBounds());
+  collapsed = false;
+  win.setResizable(true);
+  win.setMinimumSize(300, 240);
+  win.setBounds(target, false);
+  win.show();
+  win.focus();
+  return { collapsed, snapEnabled };
+}
+
+function endBallDrag() {
+  dragOffset = null;
+  if (!win || win.isDestroyed() || !collapsed) return;
+  if (snapEnabled) {
+    const pos = snapPosition(win.getBounds());
+    win.setBounds({ x: pos.x, y: pos.y, width: BALL_SIZE, height: BALL_SIZE }, false);
+  }
+  saveBallPosition();
+}
+
+function broadcastState() {
+  if (!win || win.isDestroyed() || win.webContents.isLoading()) return;
+  win.webContents.send('float:state', { pinned, snapEnabled, collapsed });
 }
 
 function main() {
@@ -82,30 +230,48 @@ function main() {
 
   app.on('second-instance', () => {
     if (!win || win.isDestroyed()) return;
+    if (collapsed) expandWindow();
     if (!win.isVisible()) win.show();
     win.focus();
+    broadcastState();
   });
 
   app.whenReady().then(() => {
+    loadPrefs();
+
     const saved = loadBounds();
-    const area = screen.getPrimaryDisplay().workArea;
-    const width = saved ? saved.width : 360;
-    const height = saved ? saved.height : 500;
-    const x = saved ? saved.x : area.x + area.width - width - 24;
-    const y = saved ? saved.y : area.y + Math.max(24, Math.round((area.height - height) / 2));
+    expandedBounds = saved || defaultBounds();
+    collapsed = snapEnabled;
+
+    let width;
+    let height;
+    let x;
+    let y;
+    if (collapsed) {
+      const ball = loadBallPosition() || snapPosition(expandedBounds);
+      width = BALL_SIZE;
+      height = BALL_SIZE;
+      x = ball.x;
+      y = ball.y;
+    } else {
+      width = expandedBounds.width;
+      height = expandedBounds.height;
+      x = expandedBounds.x;
+      y = expandedBounds.y;
+    }
 
     win = new BrowserWindow({
       width,
       height,
       x,
       y,
-      minWidth: 300,
-      minHeight: 240,
+      minWidth: collapsed ? 80 : 300,
+      minHeight: collapsed ? 80 : 240,
       frame: false,
       transparent: true,
       backgroundColor: '#00000000',
       hasShadow: false,
-      resizable: true,
+      resizable: !collapsed,
       maximizable: false,
       fullscreenable: false,
       skipTaskbar: true,
@@ -142,23 +308,45 @@ function main() {
     let saveTimer = null;
     const scheduleSave = () => {
       clearTimeout(saveTimer);
-      saveTimer = setTimeout(saveBounds, 400);
+      saveTimer = setTimeout(() => {
+        if (collapsed) saveBallPosition();
+        else saveBounds();
+      }, 400);
     };
     win.on('move', scheduleSave);
     win.on('resize', scheduleSave);
-    win.on('close', saveBounds);
+    win.on('close', () => {
+      if (collapsed) saveBallPosition();
+      else saveBounds();
+    });
     win.on('closed', () => { win = null; });
   });
 
   app.on('window-all-closed', () => app.quit());
 }
 
-ipcMain.handle('float:info', () => ({ pinned }));
+ipcMain.handle('float:info', () => ({ pinned, snapEnabled, collapsed }));
 
 ipcMain.handle('float:toggle-pin', () => {
   pinned = !pinned;
   if (win && !win.isDestroyed()) win.setAlwaysOnTop(pinned, 'floating');
-  return { pinned };
+  return { pinned, snapEnabled, collapsed };
+});
+
+ipcMain.handle('float:set-snap', (_e, enabled) => {
+  snapEnabled = Boolean(enabled);
+  savePrefs();
+  if (snapEnabled) {
+    collapseToBall();
+  } else if (collapsed) {
+    expandWindow();
+  }
+  return { pinned, snapEnabled, collapsed };
+});
+
+ipcMain.handle('float:expand', () => {
+  expandWindow();
+  return { pinned, snapEnabled, collapsed };
 });
 
 ipcMain.on('float:close', () => app.quit());
@@ -168,9 +356,30 @@ ipcMain.on('float:open-app', () => {
 });
 
 ipcMain.on('float:resize', (_e, height) => {
-  if (!win || win.isDestroyed()) return;
+  if (!win || win.isDestroyed() || collapsed) return;
   const h = Math.round(Number(height));
   if (!Number.isFinite(h)) return;
   const [w] = win.getSize();
   win.setSize(w, Math.max(240, Math.min(760, h)), true);
+});
+
+ipcMain.on('float:drag-start', (_e, x, y) => {
+  if (!win || win.isDestroyed() || !collapsed) return;
+  const sx = Number(x);
+  const sy = Number(y);
+  if (!Number.isFinite(sx) || !Number.isFinite(sy)) return;
+  const [wx, wy] = win.getPosition();
+  dragOffset = { dx: sx - wx, dy: sy - wy };
+});
+
+ipcMain.on('float:drag-move', (_e, x, y) => {
+  if (!win || win.isDestroyed() || !collapsed || !dragOffset) return;
+  const sx = Number(x);
+  const sy = Number(y);
+  if (!Number.isFinite(sx) || !Number.isFinite(sy)) return;
+  win.setPosition(Math.round(sx - dragOffset.dx), Math.round(sy - dragOffset.dy));
+});
+
+ipcMain.on('float:drag-end', () => {
+  endBallDrag();
 });

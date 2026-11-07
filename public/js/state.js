@@ -11,6 +11,7 @@ export const state = {
   today: '',
   tasks: [],
   plans: [],
+  projects: [],
   archives: [],
   conversations: [],
   settings: null,
@@ -47,6 +48,7 @@ export async function refresh() {
     today: data.today,
     tasks: data.tasks,
     plans: data.plans,
+    projects: data.projects || [],
     archives: data.archives,
     conversations: data.conversations,
     settings: data.settings,
@@ -74,6 +76,15 @@ export function isOverdue(task) {
 
 export function planById(id) {
   return state.plans.find((p) => p.id === id) || null;
+}
+
+export function projectById(id) {
+  return state.projects.find((p) => p.id === id) || null;
+}
+
+export function courseById(project, courseId) {
+  if (!project) return null;
+  return (project.courses || []).find((c) => c.id === courseId) || null;
 }
 
 /** 今天要做的未完成任务 */

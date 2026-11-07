@@ -48,6 +48,23 @@ export const api = {
   deletePlan: (id) => req('DELETE', `/api/plans/${id}`),
   planTasks: (id) => req('GET', `/api/plans/${id}/tasks`).then((d) => d.tasks),
 
+  // 学习项目
+  listProjects: () => req('GET', '/api/projects').then((d) => d.projects),
+  createProject: (payload) => req('POST', '/api/projects', payload).then((d) => d.project),
+  getProject: (id) => req('GET', `/api/projects/${id}`).then((d) => d.project),
+  patchProject: (id, payload) => req('PATCH', `/api/projects/${id}`, payload).then((d) => d.project),
+  deleteProject: (id) => req('DELETE', `/api/projects/${id}`),
+  addCourse: (projectId, payload) =>
+    req('POST', `/api/projects/${projectId}/courses`, payload).then((d) => d.course),
+  patchCourse: (projectId, courseId, payload) =>
+    req('PATCH', `/api/projects/${projectId}/courses/${courseId}`, payload).then((d) => d.course),
+  deleteCourse: (projectId, courseId) =>
+    req('DELETE', `/api/projects/${projectId}/courses/${courseId}`),
+  continueCourse: (projectId, courseId) =>
+    req('POST', `/api/projects/${projectId}/courses/${courseId}/continue`, {}),
+  completeCourse: (projectId, courseId) =>
+    req('POST', `/api/projects/${projectId}/courses/${courseId}/complete`, {}),
+
   // 对话
   listConversations: () => req('GET', '/api/conversations').then((d) => d.conversations),
   createConversation: (payload) => req('POST', '/api/conversations', payload || {}).then((d) => d.conversation),
@@ -87,6 +104,8 @@ export const api = {
   listFocus: () => req('GET', '/api/focus'),
   createFocusSession: (payload) => req('POST', '/api/focus/sessions', payload).then((d) => d),
   undoFocusSession: (id) => req('POST', `/api/focus/sessions/${id}/undo`, {}).then((d) => d),
+  mergeFocusContent: (payload) => req('POST', '/api/focus/content/merge', payload),
+  unmergeFocusContent: (payload) => req('POST', '/api/focus/content/unmerge', payload),
 
   // 进行中的这一轮：浏览器与桌面浮窗共用
   activeFocus: () => req('GET', '/api/focus/active'),
@@ -113,6 +132,36 @@ export const api = {
     req('POST', `/api/textbooks/${id}/sections/${sectionId}/explain`, { refresh }),
   chatTextbookSection: (id, sectionId, question) =>
     req('POST', `/api/textbooks/${id}/sections/${sectionId}/chat`, { question }),
+  diagramTextbookSection: (id, sectionId, question) =>
+    req('POST', `/api/textbooks/${id}/sections/${sectionId}/diagram`, { question }),
+  // 外刊阅读
+  listArticles: () => req('GET', '/api/articles').then((d) => d.articles),
+  createArticle: (payload) => req('POST', '/api/articles', payload).then((d) => d.article),
+  getArticle: (id) => req('GET', `/api/articles/${id}`),
+  patchArticle: (id, payload) => req('PATCH', `/api/articles/${id}`, payload).then((d) => d.article),
+  deleteArticle: (id) => req('DELETE', `/api/articles/${id}`),
+  replaceArticleContent: (id, payload) =>
+    req('PUT', `/api/articles/${id}/content`, payload).then((d) => d),
+  saveArticleProgress: (id, payload) =>
+    req('PATCH', `/api/articles/${id}/progress`, payload).then((d) => d.progress),
+  addHighlight: (id, payload) => req('POST', `/api/articles/${id}/highlights`, payload).then((d) => d.highlight),
+  patchHighlight: (id, highlightId, payload) =>
+    req('PATCH', `/api/articles/${id}/highlights/${highlightId}`, payload).then((d) => d.highlight),
+  deleteHighlight: (id, highlightId) =>
+    req('DELETE', `/api/articles/${id}/highlights/${highlightId}`),
+  lookupArticleText: (id, selection) =>
+    req('POST', `/api/articles/${id}/lookup`, { selection }),
+  getArticleChat: (id) => req('GET', `/api/articles/${id}/chat`).then((d) => d.messages),
+  sendArticleMessage: (id, content, selection) =>
+    req('POST', `/api/articles/${id}/chat`, { content, selection }),
+  clearArticleChat: (id) => req('DELETE', `/api/articles/${id}/chat`),
+
+  // 生词本
+  listVocabulary: () => req('GET', '/api/vocabulary').then((d) => d.vocabulary),
+  addVocabulary: (payload) => req('POST', '/api/vocabulary', payload),
+  patchVocabulary: (id, payload) => req('PATCH', `/api/vocabulary/${id}`, payload).then((d) => d.entry),
+  deleteVocabulary: (id) => req('DELETE', `/api/vocabulary/${id}`),
+
   uploadTextbookFile: async (id, file) => {
     let res;
     try {

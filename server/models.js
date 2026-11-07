@@ -62,6 +62,9 @@ function newTask(input = {}) {
     status: oneOf(input.status, TASK_STATUS, 'todo'),
     priority: oneOf(input.priority, TASK_PRIORITY, 'normal'),
     planId: input.planId ? str(input.planId, 64) : null,
+    /** 可选：任务属于哪个学习项目 / 课程；没有就保持 null */
+    projectId: input.projectId ? str(input.projectId, 64) : null,
+    courseId: input.courseId ? str(input.courseId, 64) : null,
     scheduledDate: dateOnly(input.scheduledDate),
     dueDate: dateOnly(input.dueDate),
     source: oneOf(input.source, TASK_SOURCE, 'manual'),
@@ -91,6 +94,10 @@ function patchTask(task, patch = {}) {
   }
   if (TASK_PRIORITY.includes(patch.priority)) task.priority = patch.priority;
   if (patch.planId !== undefined) task.planId = patch.planId ? str(patch.planId, 64) : null;
+  if (patch.projectId !== undefined) task.projectId = patch.projectId ? str(patch.projectId, 64) : null;
+  if (patch.courseId !== undefined) task.courseId = patch.courseId ? str(patch.courseId, 64) : null;
+  // 没有项目就不可能还挂在一门课下面
+  if (!task.projectId) task.courseId = null;
   if (patch.scheduledDate !== undefined) task.scheduledDate = dateOnly(patch.scheduledDate);
   if (patch.dueDate !== undefined) task.dueDate = dateOnly(patch.dueDate);
   return task;
@@ -147,6 +154,11 @@ function newMessage(input = {}) {
     provider: oneOf(input.provider, ['mock', 'ollama', 'real'], 'mock'),
     /** 可选的调用信息，例如 Ollama 的模型名与耗时；只用于显示，不参与逻辑 */
     meta: input.meta || null,
+    /**
+     * 这一轮实际引用的学习数据快照：只有选择范围、来源和统计。
+     * 不保存完整摘要，避免把学习数据写进历史对话。
+     */
+    context: input.context || null,
   };
 }
 
@@ -170,6 +182,11 @@ function newConversation(input = {}) {
     pendingIntent: null,
     /** 从对话里已经确认过的行动 id，用于防止重复创建 */
     confirmedActionIds: [],
+    /**
+     * 用户明确选择的学习数据范围（项目 / 窗口 / 待办）。
+     * 只保存选择本身；真正发送给模型的事实每轮重新构建，不写进历史消息。
+     */
+    context: null,
   };
 }
 

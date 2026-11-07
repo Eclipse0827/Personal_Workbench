@@ -149,6 +149,268 @@ function extractSlots(text) {
   };
 }
 
+// ================================================================ 学习上下文
+
+/**
+ * 阶段 2A 的分工：
+ *   · Context Builder 只读地汇总真实记录
+ *   · 规则引擎把和当前问题相关的记录写进草稿
+ *   · Ollama 只改写表达；数字、日期、进度必须和草稿一致
+ *   · 用户只是在表达情绪时，不主动把数据塞进回复
+ */
+
+const LEARNING_DATA_ASK_RE = /(学了多久|学习时长|专注了?多久|专注记录|学习记录|学了多长时间|花了多少时间|进度|完成了多少|做了多少|待办|任务|课程|学到哪|复习到哪|这周|上周|最近\s*\d+\s*天|系统记录|我的数据|学得怎么样|学习怎么样|学习情况|学习状态)/;
+
+const EMOTION_HINT_RE = /(焦虑|担心|害怕|紧张|难受|很累|好累|累死|烦|崩溃|压力|睡不着|失眠|心慌|想哭|委屈|撑不住|不想做)/g;
+
+function wantsLearningData(text) {
+  return LEARNING_DATA_ASK_RE.test(String(text || ''));
+}
+
+function emotionHintCount(text) {
+  return (String(text || '').match(EMOTION_HINT_RE) || []).length;
+}
+
+function formatDuration(seconds) {
+  const minutes = Math.round((Number(seconds) || 0) / 60);
+  if (minutes <= 0) return '不到 1 分钟';
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`;
+}
+
+function contextTopics(text) {
+  const t = String(text || '');
+  return {
+    focus: /(学了多久|学习时长|专注了?多久|专注记录|学习记录|学了多长时间|花了多少时间|时间花)/.test(t),
+    project: /(进度|课程|集数|学到哪|项目)/.test(t),
+    tasks: /(待办|任务|完成|做了多少|勾掉)/.test(t),
+    overall: /(学得怎么样|学习怎么样|学习情况|学习状态|最近怎么样|数据|记录|总结)/.test(t),
+  };
+}
+
+/**
+ * 只把和这一轮问题有关的事实写进草稿，而不是把整份摘要倒出来。
+ * 「没有记录」一律写成「系统里没有记录」，绝不写成「没有学习」。
+ */
+function buildContextNote(context, { userText = '', intent = 'analyze' } = {}) {
+  if (!context || !context.selected) return '';
+  const facts = context.facts || {};
+  const topics = contextTopics(userText);
+  const planWanted = intent === 'plan' || intent === 'execute';
+  const askedAnything = topics.focus || topics.project || topics.tasks || topics.overall;
+  if (!askedAnything && !planWanted) return '';
+
+  const project = facts.project;
+  const focus = facts.focus;
+  const tasks = facts.tasks;
+  const projectNamed = project && String(userText).includes(project.title);
+  const lines = [];
+
+  if (topics.project || topics.overall || projectNamed || (planWanted && project)) {
+    if (!project) {
+      if (topics.project) lines.push('你没有选择学习项目，系统无法回答课程进度。');
+    } else if (!project.courses.length) {
+      lines.push(`系统里「${project.title}」还没有课程记录。`);
+    } else if (!project.progress.calculable) {
+      lines.push(`系统里「${project.title}」有 ${project.courses.length} 门课程，但没有填总集数，算不出整体进度。`);
+    } else {
+      lines.push(`系统里「${project.title}」共 ${project.progress.totalEpisodes} 集，已完成 ${project.progress.completedEpisodes} 集（${project.progress.percent}%）。`);
+      if (project.progress.coursesWithoutTotal > 0) {
+        lines.push(`另有 ${project.progress.coursesWithoutTotal} 门课程未填总集数，不参与这个进度。`);
+      }
+    }
+  }
+
+  if (topics.focus || topics.overall || (planWanted && !project)) {
+    if (!focus) {
+      if (topics.focus) lines.push('你没有选择专注记录，系统无法回答学习时长。');
+    } else if (focus.sessionCount === 0) {
+      lines.push(`最近 ${focus.windowDays} 天系统里没有专注记录——这只是没有记录，不能说明你没有学习。`);
+    } else {
+      lines.push(`最近 ${focus.windowDays} 天系统里有 ${focus.sessionCount} 次专注记录，共 ${formatDuration(focus.totalSeconds)}。`);
+      if (project && focus.linkedToProject) {
+        if (focus.linkedToProject.sessions === 0) {
+          lines.push(`这些专注记录都没有关联到「${project.title}」，不能据此判断这个项目的学习时长。`);
+        } else if (focus.unlinked && focus.unlinked.sessions > 0) {
+          lines.push(`其中 ${focus.linkedToProject.sessions} 次能关联到「${project.title}」（${focus.linkedToProject.minutes} 分钟），另外 ${focus.unlinked.sessions} 次没有关联、未计入。`);
+        } else {
+          lines.push(`其中 ${focus.linkedToProject.sessions} 次能关联到「${project.title}」，共 ${focus.linkedToProject.minutes} 分钟。`);
+        }
+      }
+    }
+  }
+
+  if (topics.tasks) {
+    if (!tasks) {
+      lines.push('你没有选择待办数据，系统无法回答任务完成情况。');
+    } else if (tasks.today.total === 0 && tasks.overdue.total === 0
+      && (!tasks.windowDone || tasks.windowDone.count === 0)) {
+      lines.push('待办里系统没有今天或所选范围内的记录——这只是没有记录，不能说明你没有做事。');
+    } else {
+      lines.push(`待办今天 ${tasks.today.total} 项：完成 ${tasks.today.done} 项，未完成 ${tasks.today.open} 项；逾期 ${tasks.overdue.total} 项。`);
+      if (tasks.windowDone && tasks.windowDone.count > 0) {
+        lines.push(`最近 ${tasks.windowDone.days} 天完成 ${tasks.windowDone.count} 项。`);
+      }
+    }
+  }
+
+  if (topics.overall && !lines.length) {
+    lines.push('系统没有知识点、错题和复习进度的记录，这部分无法判断。');
+  }
+
+  if (!lines.length) return '';
+  return lines.map((line) => `· ${line}`).join('\n');
+}
+
+/**
+ * 这一轮该不该引用数据。
+ * 只有用户在问记录、或者明确要计划时才用；纯情绪表达和倾诉不强行引用。
+ */
+function shouldUseContext(context, userText, intent) {
+  if (!context || !context.selected) return false;
+  const dataRequested = wantsLearningData(userText);
+  if (intent === 'pour') return dataRequested;
+  if (intent === 'analyze' && !dataRequested && emotionHintCount(userText) > 0) return false;
+  return true;
+}
+
+// ================================================================ 事实一致性
+
+const CN_DIGITS = {
+  零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+};
+
+/** 小模型可能把数字写成中文，统一成阿拉伯数字再比较 */
+function cnToNumber(raw) {
+  const s = String(raw || '').trim();
+  if (/^\d+(?:\.\d+)?$/.test(s)) return Number(s);
+  if (!/^[零〇一二两三四五六七八九十百]+$/.test(s)) return null;
+  if (s.includes('百')) {
+    const [head, tail] = s.split('百');
+    const hundreds = head ? (CN_DIGITS[head] ?? 0) : 1;
+    if (!tail) return hundreds * 100;
+    if (tail.includes('十')) {
+      const [tensPart, onesPart] = tail.split('十');
+      const tens = tensPart ? (CN_DIGITS[tensPart] ?? 0) : 1;
+      return hundreds * 100 + tens * 10 + (onesPart ? (CN_DIGITS[onesPart] ?? 0) : 0);
+    }
+    return hundreds * 100 + (CN_DIGITS[tail] ?? 0);
+  }
+  if (s.includes('十')) {
+    const [tensPart, onesPart] = s.split('十');
+    const tens = tensPart ? (CN_DIGITS[tensPart] ?? 0) : 1;
+    return tens * 10 + (onesPart ? (CN_DIGITS[onesPart] ?? 0) : 0);
+  }
+  return CN_DIGITS[s] ?? null;
+}
+
+const FACT_NUMBER = '(\\d+(?:\\.\\d+)?|[零〇一二两三四五六七八九十百]+)';
+const FACT_DATE_RE = new RegExp('(\\d{4})\\s*[-/年]\\s*(\\d{1,2})\\s*[-/月]\\s*(\\d{1,2})\\s*日?', 'g');
+const FACT_MD_RE = new RegExp('(\\d{1,2})\\s*月\\s*(\\d{1,2})\\s*日', 'g');
+const FACT_MONTH_RE = new RegExp('(\\d{1,2})\\s*月', 'g');
+const FACT_COURSE_RE = new RegExp(`${FACT_NUMBER}\\s*门\\s*课程`, 'g');
+const FACT_COUNT_RE = new RegExp(`${FACT_NUMBER}\\s*个\\s*(任务|待办|项目|课程|小时|分钟)`, 'g');
+const FACT_UNIT_RE = new RegExp(`${FACT_NUMBER}\\s*(分钟|个小时|小时|钟头|天|项|条|集|节|%)`, 'g');
+
+function normalizeFactUnit(unit) {
+  return unit === '个小时' || unit === '钟头' ? '小时' : unit;
+}
+
+/**
+ * 只抽取「学习事实」相关的数字：时长、集数、任务数量、进度、日期。
+ * 普通语言里的数字（「分成 2 步」「深呼吸 3 次」）不参与一致性检查。
+ */
+function extractFactTokens(text) {
+  let rest = String(text || '');
+  const tokens = new Set();
+  const take = (re, build) => {
+    rest = rest.replace(re, (...args) => {
+      const token = build(args);
+      if (token) tokens.add(token);
+      return ' ';
+    });
+  };
+
+  take(FACT_DATE_RE, (m) => {
+    const month = Number(m[2]);
+    const day = Number(m[3]);
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    return `date:${Number(m[1])}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  });
+  take(FACT_MD_RE, (m) => {
+    const month = Number(m[1]);
+    const day = Number(m[2]);
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    return `date:*${month}-${day}`;
+  });
+  take(FACT_MONTH_RE, (m) => {
+    const month = Number(m[1]);
+    return month >= 1 && month <= 12 ? `month:${month}` : null;
+  });
+  take(FACT_COURSE_RE, (m) => {
+    const n = cnToNumber(m[1]);
+    return n === null ? null : `${n}门课程`;
+  });
+  take(FACT_COUNT_RE, (m) => {
+    const n = cnToNumber(m[1]);
+    return n === null ? null : `${n}个${m[2]}`;
+  });
+  take(FACT_UNIT_RE, (m) => {
+    const n = cnToNumber(m[1]);
+    return n === null ? null : `${n}${normalizeFactUnit(m[2])}`;
+  });
+  return [...tokens];
+}
+
+function collectAllowedFacts({ context, draft, userText }) {
+  const allowed = new Set();
+  const add = (value) => {
+    for (const token of extractFactTokens(value)) allowed.add(token);
+  };
+  add(userText);
+  if (context) add(context.text);
+  if (draft) {
+    add(draft.reply);
+    add(draft.contextFactText);
+    add(draft.problemCard ? JSON.stringify(draft.problemCard) : '');
+    for (const action of (draft.proposal && draft.proposal.actions) || []) {
+      add(`${action.title || ''} ${action.detail || ''} ${action.doneStandard || ''}`);
+      if (action.estimateMinutes) allowed.add(`${Number(action.estimateMinutes)}分钟`);
+      if (action.scheduledDate) allowed.add(`date:${action.scheduledDate}`);
+      if (action.dueDate) allowed.add(`date:${action.dueDate}`);
+    }
+  }
+  return allowed;
+}
+
+/**
+ * 校验模型改写里没有出现「没有依据的学习数字」。
+ * 只比较学习事实，不因为普通数字误判。
+ */
+function checkFactConsistency(text, { context = null, draft = null, userText = '' } = {}) {
+  const allowed = collectAllowedFacts({ context, draft, userText });
+  const used = extractFactTokens(text);
+  const unknown = used.filter((token) => !allowed.has(token));
+  if (unknown.length) {
+    return {
+      ok: false,
+      reason: `出现了没有依据的数字：${unknown.slice(0, 3).join('、')}`,
+      unknown,
+    };
+  }
+  return { ok: true, reason: '', used };
+}
+
+/** 改写不能把草稿里的事实漏掉 */
+function checkFactCoverage(text, factText) {
+  const required = extractFactTokens(factText);
+  const present = new Set(extractFactTokens(text));
+  const missing = required.filter((token) => !present.has(token));
+  return { ok: missing.length === 0, missing };
+}
+
 // ================================================================ 行动模板
 
 /**
@@ -387,19 +649,26 @@ function pick(list, seed) {
  */
 function buildMockReply({
   userText, intent, domain, slots, userSlots, needsKeyQuestion, keyQuestion, proposal, card, turnIndex,
+  contextBlock = '', dataRequested = false,
 }) {
   const seed = (userText || '').length + turnIndex * 7;
   const labels = (keys) => keys.map((k) => MODULE_DEFS.find((x) => x.key === k).label).join('、');
   const parts = [];
 
   // 1) 先接住
-  parts.push(empathyFor(intent, card, seed));
+  // 用户直接问记录时，不要把他自己的问题再复述一遍；先说明看的是系统记录。
+  if (dataRequested) {
+    parts.push(emotionHintCount(userText) ? '嗯，我在。我看了下系统里现有的记录。' : '好，我看了下系统里现有的记录。');
+  } else {
+    parts.push(empathyFor(intent, card, seed));
+  }
 
   // 2) 只想倾诉：不推计划，留一个口子
   if (intent === 'pour') {
     // 只引用「这一轮」提到的科目，避免把上一轮的话题翻出来
     const nowModules = (userSlots && userSlots.modules) || [];
     if (nowModules.length) parts.push(`你提到在准备${labels(nowModules)}，我先记着。`);
+    if (contextBlock) parts.push(contextBlock);
     const unknown = card && card.unknowns && card.unknowns[0];
     if (unknown) parts.push(`不过有件事还没定下来：${String(unknown).slice(0, 50)}。这块不着急，等你有力气再说。`);
     parts.push('想多说一点的话我就在这儿听。不想说了也没关系，先去做点别的也行。');
@@ -430,6 +699,9 @@ function buildMockReply({
     parts.push(`我注意到还有件事悬着：${String(unknown).slice(0, 50)}。它可能不是现在就要解决的。`);
   }
 
+  // 系统记录单独成段，并明确它只是记录，不是对用户状态的推断
+  if (contextBlock) parts.push(contextBlock);
+
   // 5) 建议：说成「我建议你可以……」而不是「下面这 3 件事」
   if (proposal && proposal.actions.length) {
     const a0 = proposal.actions[0];
@@ -439,6 +711,8 @@ function buildMockReply({
       : `我建议你可以先试试：${a0.title}。`;
     parts.push(suggest);
     parts.push('不用一次把整件事解决掉。要我把这几步放进待办吗？你说不用也完全没关系。');
+  } else if (dataRequested) {
+    parts.push('你想接着问哪一部分都可以。');
   } else {
     parts.push('你想让我帮你把它变成几条能勾掉的小事吗？也可以先放一放，不用现在决定。');
   }
@@ -453,7 +727,9 @@ function buildMockReply({
  *   · 从 conversation.asked 里知道哪些问题已经问过
  *   · 从历史消息里累积已经得到的科目信息
  */
-function mockRespond(conversation, userText) {
+function mockRespond(conversation, userText, options = {}) {
+  const context = options.context || null;
+  const dataRequested = wantsLearningData(userText);
   const history = conversation.messages || [];
   const asked = new Set(conversation.asked || []);
   const turnIndex = history.filter((m) => m.role === 'user').length;
@@ -480,13 +756,22 @@ function mockRespond(conversation, userText) {
   const slots = extractSlots(wholeText);
   const userSlots = extractSlots(userText);
 
+  // 只在这一轮确实需要时引用学习数据；纯情绪表达不会被数据打断
+  const contextNote = shouldUseContext(context, userText, intent)
+    ? buildContextNote(context, { userText, intent })
+    : '';
+  const contextBlock = contextNote
+    ? `系统里的记录：\n${contextNote}\n这些只是系统里现有的记录，不代表全部。`
+    : '';
+
   // ---- 是否需要问一个关键问题
   // 只有「不知道会影响行动方向」的时候才问，而且同一个问题只问一次。
   let needsKeyQuestion = false;
   let keyQuestion = '';
   const wantsPlan = intent === 'plan' || intent === 'execute';
 
-  if (wantsPlan && (domain.id === 'kaoyan' || domain.id === 'general') && slots.modules.length === 0 && !asked.has('modules')) {
+  if (wantsPlan && (domain.id === 'kaoyan' || domain.id === 'general') && slots.modules.length === 0
+    && !asked.has('modules') && !dataRequested) {
     needsKeyQuestion = true;
     keyQuestion = domain.id === 'kaoyan'
       ? '你现在主要准备哪几科？比如数学、英语、政治、专业课——只说你已经确定的那几科就行，还没定的可以先放着。'
@@ -502,17 +787,16 @@ function mockRespond(conversation, userText) {
   if (!cardHasContent) problemCard = null;
 
   // ---- 建议（不再是「方案卡」）
-  // 触发条件放宽：不再需要用户先说「帮我拆成小任务」。
-  // 只要这一轮能落地（有具体领域、且不是只想倾诉），就在对话里直接给建议，
-  // 由用户决定要不要确认成待办。这正是「说我建议你可以怎么样，然后我确认」的做法。
+  // 只在这一轮明确要求规划/拆解时生成方案。
+  // 用户只是描述状态或提问时，先回答，不自动塞一张计划。
   let proposal = null;
   const canSuggest = !needsKeyQuestion
     && domain.id !== 'self'
-    && (wantsPlan || intent === 'analyze')
-    && !(intent === 'pour');
+    && wantsPlan
+    && intent !== 'pour';
 
   if (canSuggest) {
-    const actions = pickActions(domain, slots, { max: wantsPlan ? 4 : 3 });
+    const actions = pickActions(domain, slots, { max: 4 });
     if (actions.length) {
       const pendingItems = [];
       if (slots.schoolUndecided) {
@@ -556,7 +840,7 @@ function mockRespond(conversation, userText) {
 
   const reply = buildMockReply({
     userText, intent, domain, slots, userSlots, needsKeyQuestion, keyQuestion, proposal,
-    card: currentCard, turnIndex,
+    card: currentCard, turnIndex, contextBlock, dataRequested,
   });
 
   // 状态推进：
@@ -582,6 +866,10 @@ function mockRespond(conversation, userText) {
     asked: newAsked,
     pendingIntent: nextPendingIntent,
     hint,
+    contextUsed: Boolean(contextBlock),
+    contextFactText: contextBlock,
+    /** 只含事实条目，给 Ollama 做短改写用 */
+    contextFactLines: contextNote,
   };
 }
 
@@ -827,16 +1115,44 @@ const BAD_MODEL_REPLY = /(用户|作为助手|系统整理|整理出的事实|�
  *   · 把输入的提示原样回显。
  * 这些都不该出现在对话里。宁可退回规则引擎那句已经写好的话。
  */
-function replyIsUnusable(text, userText = '') {
+function replyIsUnusable(text, userText = '', options = {}) {
   if (!text || typeof text !== 'string') return true;
   const t = text.trim();
+  const maxLength = Number(options.maxLength) || 120;
   if (t.length < 6) return true;
-  if (t.length > 120) return true;
+  if (t.length > maxLength) return true;
   if (BAD_MODEL_REPLY.test(t)) return true;
   // 客服腔 / 资源推荐腔 / 泛泛建议腔
   if (/(欢迎继续咨询|欢迎随时|希望对你有帮助|以上建议|如有需要|文都|网课平台|报名辅导|参加.{0,4}课程|阅读.{0,4}书籍|在线课程|辅导班|培训机构)/.test(t)) return true;
   // 回显：把用户原话或提示里的标签照抄回来
   if (userText && userText.trim().length >= 8 && t.includes(userText.trim().slice(0, 10))) return true;
+  // 近似回显：小模型有时只把「我」换成「你」，几乎原样复述一遍
+  if (userText) {
+    const normalize = (s) => String(s).replace(/[，。！？、；：\s]/g, '').replace(/[你我]/g, '');
+    const u = normalize(userText);
+    const m = normalize(t);
+    if (u.length >= 8 && m.length >= 6 && m.length <= u.length + 4
+      && (m.includes(u.slice(0, 8)) || u.includes(m.slice(0, 8)))) return true;
+  }
+  // 原文里没有的英文词（例如把「你」写成 you），说明模型自己编了内容
+  if (options.sourceText) {
+    const latin = (s) => String(s).match(/[A-Za-z]+/g) || [];
+    const allowed = new Set(latin(options.sourceText).map((w) => w.toLowerCase()));
+    if (latin(t).some((w) => !allowed.has(w.toLowerCase()))) return true;
+  }
+  // 改写事实时把提示词或条目符号也吐了出来，说明它没有真正改写
+  if (options.rewriteWithContext) {
+    if (/(系统记录|改写|一句自然|必须遵守|只输出)/.test(t)) return true;
+    if (/[·•]/.test(t)) return true;
+    if (t.split('\n').filter((line) => line.trim()).length > 2) return true;
+  }
+  // 倾诉轮只接住情绪：不能变成一段泛泛的安慰和建议
+  if (!options.rewriteWithContext && options.intent === 'pour') {
+    if (t.length > 60) return true;
+    if (/(加油|多休息|出去走走|放松一下|每个人|不必|记住|生活都是|建议你|可以多|你应该)/.test(t)) return true;
+  }
+  // 空泛安慰：不接住具体处境，只丢一句「以后会好的」
+  if (/(天气会变好|一切都会好起来|一切都会好的|明天会更好|生活总会好|都会过去的)/.test(t)) return true;
   if (/那句回答|他说的话|前情[:：]/.test(t)) return true;
   return false;
 }
@@ -851,16 +1167,53 @@ function extractRequiredQuestion(draftReply) {
  * 让本地模型把回复重写得更自然。
  * 失败就抛异常，由 respond() 回退到规则引擎的原话。
  */
-async function ollamaReply({ settings, userText, draft }) {
-  const base = String(settings.ollamaUrl || '').replace(/\/+$/, '');
-  if (!base) throw new Error('未配置 Ollama 地址');
-  const model = settings.ollamaModel;
-  if (!model) throw new Error('还没有选择 Ollama 模型');
-
-  // 需要提问时，问题由规则引擎自己附上，模型只负责写前半句。
-  // 这样「必须问的那一个问题」永远不会被小模型吃掉。
+/**
+ * 组装 Ollama 请求。独立出来是为了让测试能直接检查「模型实际收到了什么上下文」。
+ *
+ * 两种情况：
+ *   · 这一轮引用了学习数据：给模型草稿 + 真实记录，让它改写表达，数字必须保留
+ *   · 普通闲聊：仍然只让模型写一句接住对方的话
+ */
+function buildOllamaPrompt({ userText, draft, context }) {
   const requiredQuestion = extractRequiredQuestion(draft.reply);
   const needQuestion = Boolean(requiredQuestion);
+  const factLines = String(draft.contextFactLines || '').trim();
+  const rewriteWithContext = Boolean(factLines);
+
+  if (rewriteWithContext) {
+    /**
+     * 实测 deepseek-r1:1.5b 拿到「草稿 + 整份上下文」时会直接回显输入。
+     * 所以这里只给它这一轮真正要用的几条事实，让它做一句话改写，
+     * 其余结构（开头、建议、结尾）仍由规则引擎保留。
+     */
+    const system = [
+      '你是「缓一缓」学习工作台里的助手。',
+      '把下面这段系统记录改写成一句自然的中文回复，直接对「你」说话。',
+      '必须遵守：',
+      '· 保留所有数字和日期，不能改数字，也不能新增数字；',
+      '· 直接使用记录里给出的数字，不要做新的计算（例如不要重新算百分比）；',
+      '· 百分比只写记录里给出的整数，不要出现小数点；',
+      '· 不能编造学习时长、课程进度、任务数量或日期；',
+      '· 没有记录只说明系统里没有记录，不能说成「你没有学习」；',
+      '· 只陈述记录本身，不要分析原因，不要加「约」「左右」这类不确定词；',
+      '· 不要照抄原文，不要加标题、引号、前缀或解释。',
+      '只输出这一句话本身。',
+    ].join('\n');
+
+    const user = [
+      '系统记录：',
+      factLines,
+    ].join('\n');
+
+    return {
+      system,
+      user,
+      requiredQuestion,
+      needQuestion,
+      rewriteWithContext,
+      contextText: factLines,
+    };
+  }
 
   // 给模型一段自然的「前情」。
   // 注意全部用第二人称写 —— 只要 prompt 里出现「用户」「他」，
@@ -869,28 +1222,33 @@ async function ollamaReply({ settings, userText, draft }) {
   if (draft.intent === 'pour') {
     brief.push('你这次只是想说说话，不需要计划，也不用给步骤。');
   }
-  if (draft.problemCard && (draft.problemCard.expressed || []).length) {
+  if (draft.intent !== 'pour' && draft.problemCard && (draft.problemCard.expressed || []).length) {
     brief.push(`你刚说出的困难是：${draft.problemCard.expressed.join('；')}。`);
   }
   if (draft.proposal) {
     brief.push(`界面下面已经列出 ${draft.proposal.actions.length} 条近期行动，你不用重复列举。`);
   }
 
-  const examples = needQuestion
+  const examples = draft.intent === 'pour'
     ? [
-        '正确示范（只接住，不提问，不列清单）：「考研这件事一直悬着确实很耗人。我们先把范围定下来，其余的慢慢来。」',
+        '正确示范（只接住，不复述，不给建议）：「嗯，我在。先不用急着做什么，想说就说。」',
       ]
-    : [
-        '正确示范（2 句，直接对「你」说话，不列清单）：「这件事拖着确实很难受。我把它拆成了几条现在能动手的小事，你挑一条先开始就行。」',
-      ];
+    : needQuestion
+      ? [
+          '正确示范（只接住，不提问，不列清单）：「考研这件事一直悬着确实很耗人。我们先把范围定下来，其余的慢慢来。」',
+        ]
+      : [
+          '正确示范（2 句，直接对「你」说话，不列清单）：「这件事拖着确实很难受。我把它拆成了几条现在能动手的小事，你挑一条先开始就行。」',
+        ];
 
   const system = [
     '你是「缓一缓」学习工作台里的助手，正在和用户一对一聊天。',
     '要求：',
     '· 直接对「你」说话，绝对不要用「用户」「他」这类第三人称；',
     '· 只说 1 到 2 句，总共不超过 50 个汉字；',
-    '· 不要复述背景信息，不要罗列步骤，不要解释你在做什么，不要提「系统」「事实」「整理」这些词；',
+    '· 不要复述对方的话，不要罗列步骤，不要解释你在做什么，不要提「系统」「事实」「整理」这些词；',
     '· 不要给建议清单，不要推荐平台、课程、资料或机构，不要说「欢迎继续咨询」；',
+    '· 不要用英文单词，也不要替对方总结他今天做了什么；',
     '· 不要做心理诊断，不要说「你应该」「你必须」；',
     needQuestion ? '· 这次不要提问 —— 问题会由界面另外显示，你只写一句接住对方的话。' : '· 如果前面已经给出行动，提一句「挑一条先开始」就够了。',
     '',
@@ -903,6 +1261,18 @@ async function ollamaReply({ settings, userText, draft }) {
     `你刚说：「${userText}」`,
     brief.length ? `前情：${brief.join('')}` : '',
   ].filter(Boolean).join('\n');
+
+  return { system, user, requiredQuestion, needQuestion, rewriteWithContext, contextText: '' };
+}
+
+async function ollamaReply({ settings, userText, draft, context }) {
+  const base = String(settings.ollamaUrl || '').replace(/\/+$/, '');
+  if (!base) throw new Error('未配置 Ollama 地址');
+  const model = settings.ollamaModel;
+  if (!model) throw new Error('还没有选择 Ollama 模型');
+
+  const prompt = buildOllamaPrompt({ userText, draft, context });
+  const { system, user, requiredQuestion, needQuestion, rewriteWithContext } = prompt;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
@@ -917,7 +1287,9 @@ async function ollamaReply({ settings, userText, draft }) {
     model,
     stream: false,
     think: false,
-    options: { temperature: 0.5, num_predict: 110, top_p: 0.9, repeat_penalty: 1.1 },
+    options: rewriteWithContext
+      ? { temperature: 0.2, num_predict: 140, top_p: 0.9, repeat_penalty: 1.1 }
+      : { temperature: 0.5, num_predict: 110, top_p: 0.9, repeat_penalty: 1.1 },
     messages: [
       { role: 'system', content: system },
       { role: 'user', content: user },
@@ -961,12 +1333,37 @@ async function ollamaReply({ settings, userText, draft }) {
   if (!text || text.length < 4) throw new Error('Ollama 返回了空内容');
 
   // 质量不行就明确说不行，由上层退回规则引擎
-  if (replyIsUnusable(text, userText)) {
+  const maxLength = rewriteWithContext ? 240 : 120;
+  if (replyIsUnusable(text, userText, {
+    maxLength,
+    sourceText: `${draft.reply}\n${draft.contextFactLines || ''}`,
+    rewriteWithContext,
+    intent: draft.intent,
+  })) {
     throw new Error('模型这次的措辞不合格（跑题、回显或空泛建议），已改用规则引擎的说法');
   }
 
-  // 需要提问时，把规则引擎的问题接在后面，保证它一定出现
-  const finalText = needQuestion ? `${text}\n\n${requiredQuestion}` : text;
+  // 重点校验学习事实：数字、日期、进度不能比草稿多，也不能比草稿少
+  const factCheck = checkFactConsistency(text, { context, draft, userText });
+  if (!factCheck.ok) {
+    throw new Error(`模型改写时改动了学习数据（${factCheck.reason}），已改用规则引擎的说法`);
+  }
+
+  let finalText;
+  if (rewriteWithContext) {
+    const coverage = checkFactCoverage(text, draft.contextFactLines);
+    if (!coverage.ok) {
+      throw new Error(`模型改写时漏掉了真实记录（${coverage.missing.slice(0, 3).join('、')}），已改用规则引擎的说法`);
+    }
+    // 只替换事实段，规则引擎写好的开头、建议和结尾保持原样
+    if (!draft.contextFactLines || !draft.reply.includes(draft.contextFactLines)) {
+      throw new Error('规则草稿里找不到可替换的记录段，已改用规则引擎的说法');
+    }
+    finalText = draft.reply.replace(draft.contextFactLines, text);
+  } else {
+    // 需要提问时，把规则引擎的问题接在后面，保证它一定出现
+    finalText = needQuestion ? `${text}\n\n${requiredQuestion}` : text;
+  }
 
   return {
     text: finalText,
@@ -982,13 +1379,14 @@ async function ollamaReply({ settings, userText, draft }) {
  * 唯一的入口。调用方（API 路由）不需要知道这次是哪个引擎、走了哪条路。
  * 任何外部引擎失败都回退到规则引擎，并如实把失败原因带回去（PRD 6.3）。
  */
-async function respond({ conversation, userText, settings }) {
+async function respond({ conversation, userText, settings, context = null }) {
   // ---- 远程 OpenAI 兼容接口：模型负责全部内容
+  // 阶段 2A 不把学习上下文发给远程接口；选择数据不等于同意外发。
   if (settings.aiProvider === 'real' && settings.apiKey) {
     try {
       return await realRespond(conversation, userText, settings);
     } catch (err) {
-      const fallback = mockRespond(conversation, userText);
+      const fallback = mockRespond(conversation, userText, { context });
       return {
         ...fallback,
         warning: `远程模型调用失败，已用本地规则引擎回复。原因：${err.message}`,
@@ -998,9 +1396,9 @@ async function respond({ conversation, userText, settings }) {
 
   // ---- 本地 Ollama：规则引擎定结构，模型只改措辞
   if (settings.aiProvider === 'ollama') {
-    const draft = mockRespond(conversation, userText);
+    const draft = mockRespond(conversation, userText, { context });
     try {
-      const out = await ollamaReply({ settings, userText, draft });
+      const out = await ollamaReply({ settings, userText, draft, context });
       return {
         ...draft,
         reply: out.text,
@@ -1016,7 +1414,7 @@ async function respond({ conversation, userText, settings }) {
     }
   }
 
-  return mockRespond(conversation, userText);
+  return mockRespond(conversation, userText, { context });
 }
 
 module.exports = {
@@ -1030,5 +1428,12 @@ module.exports = {
   listOllamaModels,
   cleanModelText,
   replyIsUnusable,
+  buildOllamaPrompt,
+  buildContextNote,
+  shouldUseContext,
+  wantsLearningData,
+  checkFactConsistency,
+  checkFactCoverage,
+  extractFactTokens,
   MODULE_DEFS,
 };

@@ -16,6 +16,9 @@
 const fs = require('fs/promises');
 const path = require('path');
 const db = require('./db');
+const contextLib = require('./context');
+const ai = require('./ai');
+const { focusStats } = require('./focus-stats');
 const textbook = require('./textbook');
 const ocr = require('./ocr');
 const glossary = require('./glossary');
@@ -63,6 +66,7 @@ async function main() {
   const before = (await req('GET', '/api/bootstrap')).data;
   const beforeTaskIds = new Set(before.tasks.map((t) => t.id));
   const beforePlanIds = new Set(before.plans.map((p) => p.id));
+  const beforeProjectIds = new Set((before.projects || []).map((p) => p.id));
   const beforeArchiveIds = new Set(before.archives.map((a) => a.id));
   const beforeConvIds = new Set(before.conversations.map((c) => c.id));
   const userArchives = before.archives.filter((a) => a.origin === 'legacy');
@@ -73,6 +77,9 @@ async function main() {
   // 用户可能正开着一轮专注；测试不碰它，也不覆盖进行中的计时文件
   const activeFocusFile = db.ACTIVE_FOCUS_FILE;
   const activeFocusSnapshot = await fs.readFile(activeFocusFile, 'utf8').catch(() => null);
+  // 归类关系是全局的；测试只在最后恢复，确保中途失败也不会留下测试别名
+  const aliasesFile = db.FOCUS_ALIASES_FILE;
+  const aliasesSnapshot = await fs.readFile(aliasesFile, 'utf8').catch(() => null);
   const activeAtStart = await db.getActiveFocus();
   const canTestActive = !activeAtStart;
   let textbookId = null;
@@ -168,6 +175,191 @@ async function main() {
   ok('★ 原任务仍然存在', afterDelTask.status === 200);
   ok('★ 原任务的计划关联被解除', afterDelTask.data.task.planId === null);
 
+  // ---------------------------------------------------------------- 学习项目
+  console.log('\n【学习项目与课程】');
+  const projectRes = await req('POST', '/api/projects', {
+    title: '考研数学（自测）', description: '数学一 + 线性代数',
+  });
+  ok('创建学习项目 → 201', projectRes.status === 201, `实际 ${projectRes.status}`);
+  const project = projectRes.data.project;
+  ok('新项目还没有课程', project.courses.length === 0);
+  ok('没有总集数时进度暂不可计算',
+    project.progress.calculable === false && project.progress.percent === null);
+
+  const courseRes = await req('POST', `/api/projects/${project.id}/courses`, {
+    title: '高数基础班', platform: 'bilibili',
+    url: 'https://www.bilibili.com/video/BV1xx411c7mD?p=1&vd_source=test',
+    totalEpisodes: 20, lastEpisode: 12, completedEpisodes: 11,
+  });
+  ok('添加课程 → 201', courseRes.status === 201, `实际 ${courseRes.status}`);
+  const course = courseRes.data.course;
+  ok('★ 最近学习集数与已完成集数分开保存',
+    course.lastEpisode === 12 && course.completedEpisodes === 11);
+  ok('课程按总集数算百分比', course.percent === 55, `实际 ${course.percent}`);
+  ok('项目进度按集数加权', courseRes.data.project.progress.percent === 55,
+    `实际 ${courseRes.data.project.progress.percent}`);
+
+  const unknownRes = await req('POST', `/api/projects/${project.id}/courses`, {
+    title: '线代（总集数未填）', platform: 'other', totalEpisodes: 0,
+    lastEpisode: 4, completedEpisodes: 4,
+  });
+  ok('★ 未填总集数的课程不参与进度计算',
+    unknownRes.data.project.progress.percent === 55
+    && unknownRes.data.project.progress.coursesWithoutTotal === 1,
+    `percent=${unknownRes.data.project.progress.percent}`);
+
+  const knownRes = await req('POST', `/api/projects/${project.id}/courses`, {
+    title: '概率论', platform: 'mooc', totalEpisodes: 30, lastEpisode: 20, completedEpisodes: 20,
+  });
+  ok('★ 多门课程按总集数加权：31 / 50 = 62%',
+    knownRes.data.project.progress.percent === 62
+    && knownRes.data.project.progress.completedEpisodes === 31
+    && knownRes.data.project.progress.totalEpisodes === 50,
+    `percent=${knownRes.data.project.progress.percent}`);
+
+  const unknownOnlyProject = (await req('POST', '/api/projects', { title: '只有未知集数（自测）' })).data.project;
+  const unknownOnlyCourse = (await req('POST', `/api/projects/${unknownOnlyProject.id}/courses`, {
+    title: '没填总集数的课程', totalEpisodes: 0, completedEpisodes: 3,
+  })).data;
+  ok('★ 所有课程都没填总集数时，项目进度暂不可计算',
+    unknownOnlyCourse.project.progress.calculable === false
+    && unknownOnlyCourse.project.progress.percent === null
+    && unknownOnlyCourse.project.progress.coursesWithoutTotal === 1);
+
+  const continued = await req('POST', `/api/projects/${project.id}/courses/${course.id}/continue`, {});
+  ok('继续学习 → 200', continued.status === 200, `实际 ${continued.status}`);
+  ok('★ 继续学习打开的是最近正在看的第 12 集', continued.data.targetEpisode === 12);
+  ok('★ B 站分 P 视频按实际打开集数定位', continued.data.located === true
+    && continued.data.url.includes('p=12'), continued.data.url);
+  ok('继续学习后写入最近学习集数与时间',
+    continued.data.course.lastEpisode === 12 && Boolean(continued.data.course.lastStudiedAt));
+
+  const completedOnce = await req('POST', `/api/projects/${project.id}/courses/${course.id}/complete`, {});
+  ok('★ 完成第 12 集后已完成集数变成 12',
+    completedOnce.status === 200 && completedOnce.data.completedEpisodes === 12,
+    `status=${completedOnce.status}`);
+
+  const repeatComplete = await req('POST', `/api/projects/${project.id}/courses/${course.id}/complete`, {});
+  ok('★ 重复完成同一集 → 409', repeatComplete.status === 409, `实际 ${repeatComplete.status}`);
+
+  const afterComplete = await req('POST', `/api/projects/${project.id}/courses/${course.id}/continue`, {});
+  ok('★ 完成本集后下一次打开第 13 集', afterComplete.data.targetEpisode === 13);
+
+  // 跳集：允许手动记录「最近看到第 18 集」，但不能据此认为 13–17 集都完成了
+  const jumped = await req('PATCH', `/api/projects/${project.id}/courses/${course.id}`, {
+    lastEpisode: 18,
+  });
+  ok('手动把最近学习集数改到第 18 集', jumped.data.course.lastEpisode === 18
+    && jumped.data.course.completedEpisodes === 12);
+  const jumpComplete = await req('POST', `/api/projects/${project.id}/courses/${course.id}/complete`, {});
+  ok('★ 跳集后不能直接完成，也不会推断中间集数',
+    jumpComplete.status === 409 && jumpComplete.data.error.includes('顺序'),
+    `实际 ${jumpComplete.status}`);
+
+  // 恢复成连续状态，确保「继续学习」永远回到实际打开的位置
+  await req('PATCH', `/api/projects/${project.id}/courses/${course.id}`, { lastEpisode: 13 });
+  const backOnTrack = await req('POST', `/api/projects/${project.id}/courses/${course.id}/continue`, {});
+  ok('★ 回到第 13 集后继续学习仍然打开第 13 集', backOnTrack.data.targetEpisode === 13);
+
+  const singleRes = await req('POST', `/api/projects/${project.id}/courses`, {
+    title: '单集公开课', platform: 'bilibili',
+    url: 'https://www.bilibili.com/video/BV1singleOnly', totalEpisodes: 0,
+  });
+  const singleCourse = singleRes.data.course;
+  const singleContinue = await req('POST', `/api/projects/${project.id}/courses/${singleCourse.id}/continue`, {});
+  ok('★ 无法确认是分 P 视频时保留原始链接',
+    singleContinue.data.located === false
+    && singleContinue.data.url === 'https://www.bilibili.com/video/BV1singleOnly');
+
+  const otherRes = await req('POST', `/api/projects/${project.id}/courses`, {
+    title: '非 B 站课程', platform: 'other',
+    url: 'https://example.com/course?p=3', totalEpisodes: 0,
+  });
+  const otherContinue = await req('POST', `/api/projects/${project.id}/courses/${otherRes.data.course.id}/continue`, {});
+  ok('★ 非 B 站链接绝不改写', otherContinue.data.located === false
+    && otherContinue.data.url === 'https://example.com/course?p=3');
+
+  const clamped = await req('PATCH', `/api/projects/${project.id}/courses/${course.id}`, {
+    totalEpisodes: 20, lastEpisode: 2, completedEpisodes: 25,
+  });
+  ok('★ 手动编辑时已完成集数不超过总集数，最近学习集数不低于已完成',
+    clamped.data.course.completedEpisodes === 20 && clamped.data.course.lastEpisode === 20,
+    `${clamped.data.course.completedEpisodes}/${clamped.data.course.lastEpisode}`);
+
+  // 任务关联
+  const linkedCourseTask = await req('POST', '/api/tasks', {
+    title: '看高数第 13 集', projectId: project.id, courseId: course.id,
+  });
+  ok('任务可以关联学习项目和课程',
+    linkedCourseTask.data.task.projectId === project.id
+    && linkedCourseTask.data.task.courseId === course.id);
+
+  const linkedByCourseOnly = await req('POST', '/api/tasks', {
+    title: '只给课程也能反推项目', courseId: knownRes.data.course.id,
+  });
+  ok('只给课程时自动补上所属项目',
+    linkedByCourseOnly.data.task.projectId === project.id
+    && linkedByCourseOnly.data.task.courseId === knownRes.data.course.id);
+
+  ok('关联不存在的项目 → 400',
+    (await req('PATCH', `/api/tasks/${linkedCourseTask.data.task.id}`, { projectId: 'no-such-project' })).status === 400);
+  ok('关联不存在的课程 → 400',
+    (await req('PATCH', `/api/tasks/${linkedCourseTask.data.task.id}`, { courseId: 'no-such-course' })).status === 400);
+
+  const otherProject = (await req('POST', '/api/projects', { title: '英语学习（自测）' })).data.project;
+  const otherCourse = (await req('POST', `/api/projects/${otherProject.id}/courses`, {
+    title: '阅读课', platform: 'other', totalEpisodes: 10,
+  })).data.course;
+  ok('项目和课程不匹配 → 400',
+    (await req('PATCH', `/api/tasks/${linkedCourseTask.data.task.id}`, {
+      projectId: project.id, courseId: otherCourse.id,
+    })).status === 400);
+
+  // 删除课程：只解除课程关联，任务和项目都保留
+  const tempCourse = (await req('POST', `/api/projects/${project.id}/courses`, {
+    title: '要删掉的课程', totalEpisodes: 5,
+  })).data.course;
+  const taskInCourse = (await req('POST', '/api/tasks', {
+    title: '课程里的任务', projectId: project.id, courseId: tempCourse.id,
+  })).data.task;
+  const delCourse = await req('DELETE', `/api/projects/${project.id}/courses/${tempCourse.id}`);
+  ok('删除课程 → 200', delCourse.status === 200);
+  ok('★ 删课程只解除课程关联', delCourse.data.detachedTasks === 1);
+  const taskAfterCourse = await req('GET', `/api/tasks/${taskInCourse.id}`);
+  ok('★ 删课程不会删任务，项目关联也保留',
+    taskAfterCourse.status === 200
+    && taskAfterCourse.data.task.courseId === null
+    && taskAfterCourse.data.task.projectId === project.id);
+
+  // 删除项目：课程一起删，任务只解除关联
+  const tempProject = (await req('POST', '/api/projects', { title: '待删除项目（自测）' })).data.project;
+  const tempProjectCourse = (await req('POST', `/api/projects/${tempProject.id}/courses`, {
+    title: '项目里的课程', totalEpisodes: 3,
+  })).data.course;
+  const taskProjectOnly = (await req('POST', '/api/tasks', {
+    title: '只挂项目的任务', projectId: tempProject.id,
+  })).data.task;
+  const taskProjectCourse = (await req('POST', '/api/tasks', {
+    title: '挂项目和课程的任务', projectId: tempProject.id, courseId: tempProjectCourse.id,
+  })).data.task;
+  const delProject = await req('DELETE', `/api/projects/${tempProject.id}`);
+  ok('删除项目 → 200', delProject.status === 200);
+  ok('★ 删项目解除全部关联任务', delProject.data.detachedTasks === 2,
+    `detached=${delProject.data.detachedTasks}`);
+  const projectGone = await req('GET', `/api/projects/${tempProject.id}`);
+  ok('删除后项目取不到 → 404', projectGone.status === 404);
+  const pTask1 = await req('GET', `/api/tasks/${taskProjectOnly.id}`);
+  const pTask2 = await req('GET', `/api/tasks/${taskProjectCourse.id}`);
+  ok('★ 删项目不会删任务', pTask1.status === 200 && pTask2.status === 200);
+  ok('★ 原任务的项目与课程关联都被清除',
+    pTask1.data.task.projectId === null && pTask2.data.task.projectId === null
+    && pTask2.data.task.courseId === null);
+
+  ok('项目列表包含新建项目',
+    (await req('GET', '/api/projects')).data.projects.some((p) => p.id === project.id));
+  ok('bootstrap 带回学习项目',
+    (await req('GET', '/api/bootstrap')).data.projects.some((p) => p.id === project.id));
+
   // ---------------------------------------------------------------- 专注
   console.log('\n【专注番茄钟】');
   const focusTask = (await req('POST', '/api/tasks', {
@@ -212,10 +404,11 @@ async function main() {
   const yEnd = new Date();
   yEnd.setDate(yEnd.getDate() - 1);
   yEnd.setHours(20, 0, 0, 0);
+  const yTitle = `自测·昨天背单词 ${Date.now()}`;
   const yFocus = await req('POST', '/api/focus/sessions', {
     clientToken: `selftest-focus-yesterday-${Date.now()}`,
     mode: 'focus',
-    title: '昨天背的单词',
+    title: yTitle,
     minutes: 15,
     actualSeconds: 900,
     startedAt: new Date(yEnd.getTime() - 15 * 60 * 1000).toISOString(),
@@ -226,20 +419,408 @@ async function main() {
   const withYesterday = (await req('GET', '/api/focus')).data;
   ok('★ 昨天完成的专注今天仍然统计得到',
     withYesterday.stats.yesterdaySessions >= 1 && withYesterday.stats.yesterdaySeconds >= 900);
-  const yContent = withYesterday.stats.byContent.find((c) => c.title === '昨天背的单词');
+  const yContent = withYesterday.stats.byContent.find((c) => c.title === yTitle);
   ok('★ 昨天专注的内容进入累计列表',
     Boolean(yContent && yContent.seconds >= 900 && yContent.sessions >= 1));
 
+  // ---------------------------------------------------------------- 专注内容归类
+  console.log('\n【专注 · 把相似写法归类】');
+  const selfMerge = await req('POST', '/api/focus/content/merge', {
+    from: '自测归类·单词', to: '自测归类·单词',
+  });
+  ok('把一项归到它自己 → 400', selfMerge.status === 400, `实际 ${selfMerge.status}`);
+
+  const mergeNow = new Date();
+  const mergeA = await req('POST', '/api/focus/sessions', {
+    clientToken: `selftest-merge-a-${Date.now()}`,
+    mode: 'focus',
+    title: '自测归类·单词',
+    minutes: 10,
+    actualSeconds: 600,
+    startedAt: new Date(mergeNow.getTime() - 10 * 60 * 1000).toISOString(),
+    endedAt: mergeNow.toISOString(),
+  });
+  const mergeB = await req('POST', '/api/focus/sessions', {
+    clientToken: `selftest-merge-b-${Date.now()}`,
+    mode: 'focus',
+    title: '自测归类·背单词',
+    minutes: 5,
+    actualSeconds: 300,
+    startedAt: new Date(mergeNow.getTime() - 5 * 60 * 1000).toISOString(),
+    endedAt: mergeNow.toISOString(),
+  });
+  extraFocusSessionIds.push(mergeA.data.session.id, mergeB.data.session.id);
+
+  const merged = await req('POST', '/api/focus/content/merge', {
+    from: '自测归类·单词', to: '自测归类·背单词',
+  });
+  ok('可以把一种写法归到另一项 → 200', merged.status === 200, `实际 ${merged.status}`);
+  ok('接口返回归类后的目标标题',
+    merged.data.alias && merged.data.alias.from === '自测归类·单词' && merged.data.alias.to === '自测归类·背单词');
+
+  const mergedStats = (await req('GET', '/api/focus')).data;
+  const mergedRow = mergedStats.stats.byContent.find((c) => c.title === '自测归类·背单词');
+  const sourceRow = mergedStats.stats.byContent.find((c) => c.title === '自测归类·单词');
+  ok('★ 归类后时长汇总只剩一行',
+    Boolean(mergedRow) && mergedRow.seconds >= 900 && mergedRow.sessions >= 2 && !sourceRow,
+    mergedRow ? `${mergedRow.seconds}s / ${mergedRow.sessions} 次` : '没有目标行');
+  ok('★ 归类不改写原始专注记录',
+    mergedStats.sessions.some((s) => s.title === '自测归类·单词')
+    && mergedStats.sessions.some((s) => s.title === '自测归类·背单词'));
+  ok('归类关系随统计一起返回',
+    mergedStats.contentAliases.some((a) => a.from === '自测归类·单词' && a.to === '自测归类·背单词'));
+  const mergedToday = mergedStats.stats.byDay.find((d) => d.date === mergedStats.stats.todayKey);
+  ok('★ 当天的内容分布也合并成一项',
+    Boolean(mergedToday && mergedToday.content.some((c) => c.title === '自测归类·背单词' && c.seconds >= 900)));
+
+  const unmerged = await req('POST', '/api/focus/content/unmerge', { from: '自测归类·单词' });
+  ok('可以取消归类 → 200', unmerged.status === 200, `实际 ${unmerged.status}`);
+  const unmergedStats = (await req('GET', '/api/focus')).data;
+  ok('★ 取消归类后恢复成两行',
+    Boolean(unmergedStats.stats.byContent.find((c) => c.title === '自测归类·单词'))
+    && Boolean(unmergedStats.stats.byContent.find((c) => c.title === '自测归类·背单词')));
+
+  const statsBeforeUndo = (await req('GET', '/api/focus')).data;
   const fUndo = await req('POST', `/api/focus/sessions/${focusSession.id}/undo`, {});
   ok('★ 撤销后待办回到原来的状态',
     fUndo.data.task.status === 'todo' && fUndo.data.task.completedAt === null);
   const focusAfterUndo = (await req('GET', '/api/focus')).data;
   ok('★ 撤销掉的一轮不再计入统计',
-    focusAfterUndo.stats.todaySessions === focusList.stats.todaySessions - 1);
+    focusAfterUndo.stats.todaySessions === statsBeforeUndo.stats.todaySessions - 1);
   ok('★ 撤销后也不再出现在按内容累计里',
     !focusAfterUndo.stats.byContent.some((c) => c.title === '背 50 个单词'));
   const fUndo2 = await req('POST', `/api/focus/sessions/${focusSession.id}/undo`, {});
   ok('重复撤销是安全的', fUndo2.data.alreadyUndone === true);
+
+  // ---------------------------------------------------------------- AI 学习上下文（阶段 1）
+  console.log('\n【AI 学习上下文 · 只读构建】');
+  let ctxConv;
+  {
+    const fakeNow = new Date();
+    const dayAgo = (n) => {
+      const d = new Date(fakeNow);
+      d.setDate(d.getDate() - n);
+      return d.toISOString();
+    };
+    const fakeSessions = [
+      { mode: 'focus', title: '窗口测试·近', actualSeconds: 600, endedAt: dayAgo(1) },
+      { mode: 'focus', title: '窗口测试·远', actualSeconds: 1200, endedAt: dayAgo(20) },
+    ];
+    const stats7 = focusStats(fakeSessions, {}, { days: 7, now: fakeNow });
+    const stats30 = focusStats(fakeSessions, {}, { days: 30, now: fakeNow });
+    ok('专注统计支持 7 天与 30 天窗口',
+      stats7.byDay.length === 7 && stats30.byDay.length === 30
+      && stats7.windowSeconds === 600 && stats30.windowSeconds === 1800,
+      `${stats7.windowSeconds}s / ${stats30.windowSeconds}s`);
+    ok('★ 30 天窗口不改变 week* 的最近 7 天含义',
+      stats30.weekSeconds === stats7.windowSeconds && stats30.weekMinutes === 10);
+
+    const ctxTask = (await req('POST', '/api/tasks', {
+      title: '上下文·关联待办', projectId: project.id, courseId: course.id, scheduledDate: today(),
+    })).data.task;
+    const ctxDoneTask = (await req('POST', '/api/tasks', {
+      title: '上下文·已完成待办', projectId: project.id, status: 'done', scheduledDate: today(),
+    })).data.task;
+    ok('准备好关联项目与课程的任务', ctxTask.projectId === project.id && ctxTask.courseId === course.id);
+    ok('完成的任务带有完成时间', Boolean(ctxDoneTask.completedAt));
+
+    const now = new Date();
+    const ctxFocus = await req('POST', '/api/focus/sessions', {
+      clientToken: `selftest-context-${Date.now()}`,
+      mode: 'focus',
+      title: '上下文·高数',
+      taskId: ctxTask.id,
+      minutes: 10,
+      actualSeconds: 600,
+      startedAt: new Date(now.getTime() - 10 * 60 * 1000).toISOString(),
+      endedAt: now.toISOString(),
+      completeTask: false,
+    });
+    ok('记录一轮可关联到项目的专注 → 201', ctxFocus.status === 201, `实际 ${ctxFocus.status}`);
+    extraFocusSessionIds.push(ctxFocus.data.session.id);
+
+    const oldEnd = new Date();
+    oldEnd.setDate(oldEnd.getDate() - 20);
+    oldEnd.setHours(20, 0, 0, 0);
+    const ctxOldFocus = await req('POST', '/api/focus/sessions', {
+      clientToken: `selftest-context-old-${Date.now()}`,
+      mode: 'focus',
+      title: '上下文·旧记录',
+      taskId: ctxTask.id,
+      minutes: 20,
+      actualSeconds: 1200,
+      startedAt: new Date(oldEnd.getTime() - 20 * 60 * 1000).toISOString(),
+      endedAt: oldEnd.toISOString(),
+      completeTask: false,
+    });
+    ok('记录一轮 20 天前的专注 → 201', ctxOldFocus.status === 201, `实际 ${ctxOldFocus.status}`);
+    extraFocusSessionIds.push(ctxOldFocus.data.session.id);
+
+    ctxConv = (await req('POST', '/api/conversations', {})).data.conversation;
+    const emptyPreview = await req('GET', `/api/conversations/${ctxConv.id}/context`);
+    ok('上下文预览接口 → 200', emptyPreview.status === 200, `实际 ${emptyPreview.status}`);
+    const empty = emptyPreview.data.context;
+    ok('★ 默认不引用任何学习数据',
+      empty.selected === false && empty.facts.project === null
+      && empty.facts.focus === null && empty.facts.tasks === null && empty.sources.length === 0);
+    ok('不选数据时明确说没有可引用记录', empty.text.includes('还没有选择学习数据'));
+    ok('★ 知识点 / 错题 / 复习进度明确标注不可用',
+      empty.available.knowledge === false && empty.available.wrongQuestions === false
+      && empty.available.review === false
+      && empty.unknowns.join('').includes('知识点')
+      && empty.unknowns.join('').includes('错题'));
+
+    const savedCtx = await req('PATCH', `/api/conversations/${ctxConv.id}`, {
+      context: { projectId: project.id, windowDays: 7, includeTasks: true },
+    });
+    ok('可以保存学习数据选择',
+      savedCtx.status === 200
+      && savedCtx.data.conversation.context.projectId === project.id
+      && savedCtx.data.conversation.context.windowDays === 7
+      && savedCtx.data.conversation.context.includeTasks === true
+      && savedCtx.data.conversation.context.includeKnowledge === false);
+
+    ok('14 天等非法窗口被拒绝',
+      (await req('PATCH', `/api/conversations/${ctxConv.id}`, {
+        context: { windowDays: 14 },
+      })).status === 400);
+    ok('★ 知识点和错题开关被拒绝',
+      (await req('PATCH', `/api/conversations/${ctxConv.id}`, {
+        context: { windowDays: 7, includeKnowledge: true },
+      })).status === 400);
+    ok('非法项目标识被拒绝',
+      (await req('PATCH', `/api/conversations/${ctxConv.id}`, {
+        context: { projectId: '../secret', windowDays: 7 },
+      })).status === 400);
+    const stillSaved = (await req('GET', `/api/conversations/${ctxConv.id}`)).data.conversation;
+    ok('★ 非法选择不会覆盖已保存的范围', stillSaved.context.windowDays === 7);
+
+    const preview = await req('GET', `/api/conversations/${ctxConv.id}/context`);
+    const built = preview.data.context;
+    ok('预览沿用对话里保存的选择',
+      built.selection.projectId === project.id && built.selection.windowDays === 7
+      && built.selection.includeTasks === true);
+    ok('项目事实来自真实课程记录',
+      built.facts.project.title === project.title
+      && built.facts.project.courses.some((c) => c.title === '高数基础班' && c.totalEpisodes === 20));
+    ok('★ 最近 7 天专注包含本次记录',
+      built.facts.focus.latestAt === ctxFocus.data.session.endedAt
+      && built.facts.focus.totalSeconds >= 600);
+    ok('★ 能通过待办关联算出项目内的专注',
+      built.facts.focus.linkedToProject.sessions === 1
+      && built.facts.focus.linkedToProject.minutes >= 10,
+      JSON.stringify(built.facts.focus.linkedToProject));
+    ok('待办完成情况读到今天与最近完成的记录',
+      built.facts.tasks.today.total >= 1
+      && Boolean(built.facts.tasks.windowDone)
+      && built.facts.tasks.windowDone.count >= 1);
+    ok('上下文文本写清来源、范围与统计',
+      built.text.includes(project.title)
+      && built.text.includes('最近 7 天专注')
+      && built.text.includes('待办')
+      && built.sources.some((s) => s.id === 'focus'));
+    ok('★ 预览接口本身不写入数据',
+      (await req('GET', `/api/conversations/${ctxConv.id}`)).data.conversation.messages.length === 0);
+
+    const wide = await req(
+      'GET',
+      `/api/conversations/${ctxConv.id}/context?projectId=${project.id}&windowDays=30`
+    );
+    ok('★ 30 天窗口包含 20 天前的记录',
+      wide.status === 200
+      && wide.data.context.facts.focus.windowDays === 30
+      && wide.data.context.facts.focus.linkedToProject.sessions >= 2
+      && wide.data.context.facts.focus.from < built.facts.focus.from,
+      JSON.stringify(wide.data.context.facts.focus && wide.data.context.facts.focus.linkedToProject));
+    ok('★ 预览查询不会改写已保存的选择',
+      (await req('GET', `/api/conversations/${ctxConv.id}`)).data.conversation.context.windowDays === 7);
+
+    const missingProject = await req('GET', `/api/conversations/${ctxConv.id}/context?projectId=proj-doesnotexist&windowDays=7`);
+    ok('★ 所选项目不存在时降级并提示',
+      missingProject.status === 200
+      && missingProject.data.context.facts.project === null
+      && missingProject.data.context.warnings.join('').includes('已不存在'));
+
+    const future = await contextLib.buildContext(
+      { windowDays: 7, includeTasks: true },
+      { now: new Date('2040-01-01T12:00:00') }
+    );
+    ok('★ 没有记录时明确说不能据此判断',
+      future.facts.focus.sessionCount === 0
+      && future.facts.tasks.today.total === 0
+      && future.caveats.length >= 2
+      && future.caveats.join('').includes('不能据此判断'));
+    ok('★ 不把「没有记录」写成「没有学习」', !future.text.includes('没有学习'));
+
+    const snapshot = contextLib.snapshotContext(built);
+    ok('★ 历史快照只保留来源、范围与统计',
+      snapshot
+      && !('text' in snapshot)
+      && !('facts' in snapshot)
+      && snapshot.selection.projectId === project.id
+      && snapshot.sources.length >= 1
+      && typeof snapshot.counts.focusSessions === 'number',
+      JSON.stringify(snapshot && Object.keys(snapshot)));
+    ok('快照不包含课程标题等完整摘要',
+      !JSON.stringify(snapshot).includes('高数基础班'));
+  }
+
+  // ---------------------------------------------------------------- AI 学习上下文（阶段 2A）
+  console.log('\n【AI 学习上下文 · 接入 Ollama（阶段 2A）】');
+  {
+    const builtForAi = (await req('GET', `/api/conversations/${ctxConv.id}/context`)).data.context;
+    const freshConv = () => ({ id: 'selftest-context', messages: [], asked: [] });
+
+    const focusAsk = ai.mockRespond(freshConv(), '我最近学了多久？', { context: builtForAi });
+    ok('★ 问到学习时长时草稿引用真实专注记录',
+      focusAsk.contextUsed === true
+      && /专注记录/.test(focusAsk.reply)
+      && /(\d+)\s*分钟|(\d+)\s*小时/.test(focusAsk.reply),
+      focusAsk.reply);
+
+    const progressAsk = ai.mockRespond(freshConv(), '我的考研数学项目进度到哪了？', { context: builtForAi });
+    const realProgress = builtForAi.facts.project.progress;
+    ok('★ 问到项目进度时使用真实集数',
+      progressAsk.contextUsed === true
+      && progressAsk.reply.includes(`${realProgress.percent}%`)
+      && progressAsk.reply.includes(String(realProgress.completedEpisodes))
+      && progressAsk.reply.includes(String(realProgress.totalEpisodes)),
+      progressAsk.reply);
+    ok('★ 只是问进度时不自动生成方案', progressAsk.proposal === null);
+
+    const taskAsk = ai.mockRespond(freshConv(), '我今天还有哪些待办？', { context: builtForAi });
+    ok('★ 问到待办时使用真实任务数量',
+      taskAsk.contextUsed === true && /待办今天\s*\d+\s*项/.test(taskAsk.reply),
+      taskAsk.reply);
+
+    const vent = ai.mockRespond(freshConv(), '我今天真的好累，什么都不想做。', { context: builtForAi });
+    ok('★ 表达疲惫时不强行引用学习数据',
+      vent.contextUsed === false && !/系统里的记录/.test(vent.reply) && !vent.reply.includes('62%'),
+      vent.reply);
+    ok('★ 倾诉时不自动生成方案', vent.proposal === null);
+
+    const planAsk = ai.mockRespond(freshConv(), '帮我规划一下考研数学接下来怎么复习。', { context: builtForAi });
+    ok('★ 明确要求规划时才生成方案', Boolean(planAsk.proposal));
+    ok('★ 规划时引用真实项目记录',
+      planAsk.contextUsed === true && planAsk.reply.includes(`${realProgress.percent}%`), planAsk.reply);
+
+    const noRecord = await contextLib.buildContext(
+      { projectId: project.id, windowDays: 7, includeTasks: true },
+      { now: new Date('2040-01-01T12:00:00') }
+    );
+    const noRecordAsk = ai.mockRespond(freshConv(), '我最近学了多久？', { context: noRecord });
+    ok('★ 没有记录时写成「系统里没有记录」而不是下结论',
+      noRecordAsk.reply.includes('系统里没有专注记录')
+      && noRecordAsk.reply.includes('这只是没有记录')
+      && noRecordAsk.reply.includes('不能说明'),
+      noRecordAsk.reply);
+
+    const allowedDraft = {
+      reply: '最近 7 天共 20 分钟，项目 50 集已完成 31 集（62%）。',
+      contextFactText: '最近 7 天共 20 分钟，项目 50 集已完成 31 集（62%）。',
+    };
+    ok('★ 事实一致性：没有依据的数字会被拒绝',
+      ai.checkFactConsistency('你最近 3 天学了 5 小时，完成了 40 集。', {
+        context: builtForAi, draft: allowedDraft,
+      }).ok === false);
+    ok('★ 事实一致性：普通语言里的数字不会被误判',
+      ai.checkFactConsistency('这件事分成 2 步，先深呼吸 3 次。', {
+        context: builtForAi, draft: allowedDraft,
+      }).ok === true);
+    ok('★ 事实一致性：草稿里的事实不能被漏掉',
+      ai.checkFactCoverage('最近 7 天共 20 分钟。', allowedDraft.contextFactText).ok === false);
+    ok('★ 改写质量：混入英文、空泛安慰或提示词回显会被拒绝',
+      ai.replyIsUnusable('今天的 you 基本上是休息了。', '我今天好累。', { sourceText: '嗯，我在。', intent: 'pour' })
+      && ai.replyIsUnusable('多休息一下，别太逼自己，加油！', '我今天好累。', { sourceText: '嗯，我在。', intent: 'pour' })
+      && ai.replyIsUnusable('系统记录改写为一句自然的中文回复：', '进度到哪了？', { rewriteWithContext: true }));
+    ok('★ 改写质量：正常的接住与事实改写可以通过',
+      !ai.replyIsUnusable('嗯，我在。先不用急着做什么，想说就说。', '我今天好累。', { sourceText: '嗯，我在。', intent: 'pour' })
+      && !ai.replyIsUnusable('数学共 46 集，已完成 19 集，完成率 41%。', '进度到哪了？', { rewriteWithContext: true }));
+
+    const prompt = ai.buildOllamaPrompt({
+      userText: '我的考研数学项目进度到哪了？', draft: progressAsk, context: builtForAi,
+    });
+    ok('★ Ollama 实际收到 Context Builder 的上下文',
+      prompt.rewriteWithContext === true
+      && prompt.contextText.length > 0
+      && prompt.user.includes('系统记录')
+      && prompt.user.includes(String(realProgress.percent))
+      && prompt.system.includes('不能新增数字')
+      && prompt.system.includes('不能说成「你没有学习」'));
+
+    // 走真实 API：服务端每轮构建上下文，助手消息只保存快照
+    const focusMsg = await req('POST', `/api/conversations/${ctxConv.id}/messages`, {
+      content: '我最近学了多久？',
+    });
+    ok('★ 对话接口把真实上下文传给规则引擎',
+      focusMsg.status === 201
+      && focusMsg.data.message.provider === 'mock'
+      && /专注记录/.test(focusMsg.data.message.content),
+      focusMsg.data.message.content);
+    const savedSnapshot = focusMsg.data.message.context;
+    ok('★ 助手消息只保存上下文快照，不保存完整摘要',
+      savedSnapshot
+      && !('text' in savedSnapshot)
+      && !('facts' in savedSnapshot)
+      && savedSnapshot.selection.projectId === project.id
+      && savedSnapshot.counts.focusSessions >= 1
+      && !JSON.stringify(savedSnapshot).includes('高数基础班'),
+      JSON.stringify(savedSnapshot && Object.keys(savedSnapshot)));
+
+    const ventMsg = await req('POST', `/api/conversations/${ctxConv.id}/messages`, {
+      content: '我今天真的好累，什么都不想做。',
+    });
+    ok('★ 通过 API 表达疲惫时也不会被数据打断',
+      !/系统里的记录/.test(ventMsg.data.message.content),
+      ventMsg.data.message.content);
+
+    const planMsg = await req('POST', `/api/conversations/${ctxConv.id}/messages`, {
+      content: '帮我规划一下考研数学接下来怎么复习。',
+    });
+    ok('★ 通过 API 明确请求计划时才出现方案',
+      planMsg.data.conversation.proposals.length >= 1
+      && /系统里的记录/.test(planMsg.data.message.content),
+      planMsg.data.message.content);
+
+    const fallback = await ai.respond({
+      conversation: freshConv(),
+      userText: '我最近学了多久？',
+      settings: { aiProvider: 'ollama', ollamaUrl: '', ollamaModel: '' },
+      context: builtForAi,
+    });
+    ok('★ Ollama 不可用时回退到规则引擎草稿',
+      fallback.provider === 'mock'
+      && fallback.contextUsed === true
+      && /专注记录/.test(fallback.reply)
+      && fallback.warning.includes('Ollama')
+      && fallback.warning.includes('规则引擎'),
+      fallback.warning);
+
+    const originalFetch = global.fetch;
+    try {
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          message: { content: '你最近 3 天学了 5 小时，项目也完成了 40 集。' },
+          model: 'selftest-fake',
+        }),
+      });
+      const badModel = await ai.respond({
+        conversation: freshConv(),
+        userText: '我最近学了多久？',
+        settings: { aiProvider: 'ollama', ollamaUrl: 'http://selftest.invalid', ollamaModel: 'fake' },
+        context: builtForAi,
+      });
+      ok('★ 模型改写改坏学习数据时回退到规则引擎',
+        badModel.provider === 'mock'
+        && badModel.warning.includes('改动了学习数据')
+        && /专注记录/.test(badModel.reply),
+        badModel.warning);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  }
 
   // ---------------------------------------------------------------- 桌面浮窗共用计时
   console.log('\n【桌面浮窗 · 共用计时】');
@@ -297,13 +878,20 @@ async function main() {
       naturalStart.status === 201 && naturalStart.data.active.remainingMs <= 1000);
     await sleep(1300);
     const natural = await req('GET', '/api/focus/active');
+    // 自测与正在使用的网页共用一份数据：到点后可能是另一个窗口先补记了自然结束，
+    // 这时本进程没有 justFinished，但这一轮同样已经正确地结掉。
+    let naturalSession = natural.data.justFinished ? natural.data.justFinished.session : null;
+    if (!naturalSession) {
+      const list = await req('GET', '/api/focus');
+      naturalSession = list.data.sessions.find((s) => s.clientToken === t2) || null;
+    }
     ok('★ 到点后任何窗口来问，都会自动结掉这一轮',
-      natural.data.active === null && Boolean(natural.data.justFinished));
-    ok('★ 自然结束同样勾选待办',
-      natural.data.justFinished.task && natural.data.justFinished.task.status === 'done');
-    extraFocusSessionIds.push(natural.data.justFinished.session.id);
-    const naturalUndo = await req('POST', `/api/focus/sessions/${natural.data.justFinished.session.id}/undo`, {});
-    ok('自然结束也可以撤销勾选', naturalUndo.data.task.status === 'todo');
+      natural.data.active === null && Boolean(naturalSession));
+    const naturalTaskNow = (await req('GET', '/api/bootstrap')).data.tasks.find((x) => x.id === naturalTask.id);
+    ok('★ 自然结束同样勾选待办', Boolean(naturalTaskNow) && naturalTaskNow.status === 'done');
+    extraFocusSessionIds.push(naturalSession.id);
+    const naturalUndo = await req('POST', `/api/focus/sessions/${naturalSession.id}/undo`, {});
+    ok('自然结束也可以撤销勾选', naturalUndo.data.task && naturalUndo.data.task.status === 'todo');
 
     const t3 = `selftest-cancel-${Date.now()}`;
     activeTokens.add(t3);
@@ -370,6 +958,14 @@ async function main() {
     `${fullBook.chapters.length} 章 / ${sections.length} 节`);
   const circuitSection = sections.find((s) => s.title.includes('欧姆定律'));
   const tcpSection = sections.find((s) => s.title.includes('TCP'));
+  ok('★ 每章都生成了本章知识地图',
+    fullBook.chapters.every((c) => {
+      const map = (fullBook.chapterGuides || {})[c.id];
+      return map && Array.isArray(map.nodes) && map.nodes.length === c.sections.length;
+    }));
+  ok('★ 知识地图的节点带原文要点',
+    Object.values(fullBook.chapterGuides || {}).some((map) => (map.nodes || [])
+      .some((node) => Array.isArray(node.points) && node.points.length > 0)));
   ok('★ 电路小节匹配到欧姆定律动画', Boolean(circuitSection && circuitSection.demos.includes('circuit-ohm')));
   ok('★ 网络小节匹配到三次握手动画', Boolean(tcpSection && tcpSection.demos.includes('tcp-handshake')));
   ok('★ 英文 packet 不会被误判成 ACK / TCP',
@@ -541,6 +1137,25 @@ async function main() {
   ok('★ 讲义记录了文字来源', explained.data.lesson.textSource === 'pdf');
   ok('讲义包含要点或正文小节',
     (explained.data.lesson.keyPoints || []).length > 0 || (explained.data.lesson.blocks || []).length > 0);
+  ok('★ 讲义交代这一节在整章里的位置',
+    String(explained.data.lesson.position || '').includes('串联与并联')
+    && !String(explained.data.lesson.position || '').includes('undefined'));
+  ok('★ 讲义按脉络分步，而不是并列清单',
+    Array.isArray(explained.data.lesson.thread)
+    && explained.data.lesson.thread.length >= 1
+    && explained.data.lesson.thread.every((step) => step.title && step.body));
+  ok('★ 本节载荷带上本章知识地图',
+    Boolean(sectionPayload.data.chapterGuide && sectionPayload.data.chapterGuide.nodes.length));
+
+  const diagram = await req('POST', `/api/textbooks/${textbookId}/sections/${circuitSection.id}/diagram`, {
+    question: '欧姆定律的推导过程是怎样的？',
+  });
+  ok('教材概念图解 → 200', diagram.status === 200, `实际 ${diagram.status}`);
+  ok('★ 图解把问题拆成步骤并标注来源',
+    diagram.data.diagram.provider === 'local'
+    && diagram.data.diagram.title.includes('欧姆定律')
+    && diagram.data.diagram.steps.length >= 1
+    && diagram.data.diagram.steps.every((step) => step.label));
 
   const explainedAgain = await req('POST', `/api/textbooks/${textbookId}/sections/${circuitSection.id}/explain`, {});
   ok('讲义已缓存时不会重复调用模型',
@@ -732,6 +1347,188 @@ async function main() {
     ok('★ 迁移档案保留原始记录段', userArchives[0].content.includes('原始记录'));
   }
 
+  // ---------------------------------------------------------------- 外刊阅读
+  console.log('\n【外刊阅读】');
+  {
+    const articleSettingsFile = path.join(db.DATA_DIR, 'settings.json');
+    const articleSettingsSnapshot = await fs.readFile(articleSettingsFile, 'utf8').catch(() => null);
+    let articleId = null;
+    let vocabId = null;
+    try {
+      // 释义与文章问答必须有真实模型；本地规则引擎应当明确拒绝，而不是编造词典内容
+      await req('PATCH', '/api/settings', { aiProvider: 'mock' });
+
+      const articleText = [
+        '# The Quiet Power of Doing Less',
+        '',
+        'Modern life rewards motion. We fill every hour and call it progress.',
+        '',
+        '## A slower rhythm',
+        '',
+        'The case for doing less is not laziness. It is attention.',
+        '',
+        'When we stop rushing, we notice what the work is actually asking for.',
+        '',
+        'That shift is small, but it changes the day.',
+        '',
+        '> Less noise, more signal.',
+        '',
+        '- Protect one unhurried hour',
+        '- Finish before adding',
+      ].join('\n');
+
+      const created = await req('POST', '/api/articles', {
+        text: articleText,
+        format: 'md',
+        fileName: 'quiet-power.md',
+        source: 'The Test Review',
+      });
+      ok('导入 Markdown 文章 → 201', created.status === 201, `实际 ${created.status}`);
+      const article = created.data.article;
+      articleId = article.id;
+      ok('没有标题时用第一个 Markdown 标题', article.title === 'The Quiet Power of Doing Less', article.title);
+      ok('Markdown 标题单独成段', article.paragraphCount >= 8, String(article.paragraphCount));
+      ok('列表与引用也被解析成独立段落', article.excerpt.length > 0);
+
+      const list = await req('GET', '/api/articles');
+      const summary = list.data.articles.find((a) => a.id === article.id);
+      ok('文章列表包含刚导入的文章', Boolean(summary));
+      ok('★ 列表不返回正文段落', summary && summary.paragraphs === undefined);
+      ok('★ 列表不返回高亮明细', summary && summary.highlights === undefined);
+      ok('列表返回摘要、词数与阅读进度',
+        Boolean(summary && summary.excerpt && summary.wordCount > 0 && summary.progress));
+
+      const detail = await req('GET', `/api/articles/${article.id}`);
+      ok('读取详情 → 200', detail.status === 200);
+      ok('详情带正文段落且 id 稳定',
+        detail.data.paragraphs[0].id === 'p-1' && detail.data.paragraphs[1].id === 'p-2');
+      ok('HTML 标签会被剥掉', !detail.data.paragraphs.some((p) => /<[^>]+>/.test(p.text)));
+
+      const patched = await req('PATCH', `/api/articles/${article.id}`, {
+        title: 'Doing Less', tags: ['attention', 'essay'], reader: { fontSize: 99 },
+      });
+      ok('编辑标题与标签 → 200',
+        patched.status === 200
+        && patched.data.article.title === 'Doing Less'
+        && patched.data.article.tags.includes('attention'));
+      ok('字号被限制在 26 以内', patched.data.article.reader.fontSize === 26);
+      ok('非法原文链接 → 400',
+        (await req('PATCH', `/api/articles/${article.id}`, { url: 'ftp://nope' })).status === 400);
+
+      const paragraphs = detail.data.paragraphs;
+      const anchor = paragraphs[3];
+      const progress = await req('PATCH', `/api/articles/${article.id}/progress`, {
+        paragraphId: anchor.id, ratio: 0.5,
+      });
+      ok('保存阅读进度 → 200', progress.status === 200);
+      ok('★ 阅读百分比由服务端计算',
+        progress.data.progress.percent === Math.round(((3 + 0.5) / paragraphs.length) * 100),
+        `${progress.data.progress.percent}`);
+      ok('不存在的段落不能当阅读位置 → 400',
+        (await req('PATCH', `/api/articles/${article.id}/progress`, {
+          paragraphId: 'p-nope', ratio: 0.2,
+        })).status === 400);
+
+      const target = paragraphs.find((p) => p.kind === 'paragraph');
+      const quote = target.text.slice(0, 12);
+      const highlight = await req('POST', `/api/articles/${article.id}/highlights`, {
+        paragraphId: target.id, start: 0, end: 12, note: '先记一下',
+      });
+      ok('添加高亮与批注 → 201', highlight.status === 201, `实际 ${highlight.status}`);
+      ok('★ 高亮引用直接取自原文', highlight.data.highlight.quote === quote);
+      ok('越界高亮被拒绝 → 400',
+        (await req('POST', `/api/articles/${article.id}/highlights`, {
+          paragraphId: target.id, start: 0, end: target.text.length + 10,
+        })).status === 400);
+
+      const editedHighlight = await req('PATCH', `/api/articles/${article.id}/highlights/${highlight.data.highlight.id}`, {
+        paragraphId: target.id, start: 0, end: 12, note: '改过的批注',
+      });
+      ok('可以修改批注', editedHighlight.status === 200
+        && editedHighlight.data.highlight.note === '改过的批注');
+
+      const lookupMock = await req('POST', `/api/articles/${article.id}/lookup`, {
+        selection: { paragraphId: target.id, start: 0, end: 4, mode: 'word' },
+      });
+      ok('★ 本地规则引擎查词明确拒绝（409）', lookupMock.status === 409, `实际 ${lookupMock.status}`);
+      ok('★ 拒绝时说明没有释义能力', /没有.*释义|本地规则引擎/.test(lookupMock.data.error || ''));
+      ok('拒绝结果里没有伪造释义',
+        !lookupMock.data.entry && !lookupMock.data.definitionZh);
+
+      const chatGet = await req('GET', `/api/articles/${article.id}/chat`);
+      ok('新文章的文章问答是空的', chatGet.status === 200 && chatGet.data.messages.length === 0);
+      const chatMock = await req('POST', `/api/articles/${article.id}/chat`, {
+        content: '这段在说什么？',
+        selection: { paragraphId: target.id, start: 0, end: 12, mode: 'phrase' },
+      });
+      ok('★ 本地规则引擎不伪装文章问答（409）', chatMock.status === 409, `实际 ${chatMock.status}`);
+      const chatStillEmpty = await req('GET', `/api/articles/${article.id}/chat`);
+      ok('★ 失败的问答不会写进历史', chatStillEmpty.data.messages.length === 0);
+
+      const vocab = await req('POST', '/api/vocabulary', {
+        articleId: article.id,
+        term: 'mitigate',
+        kind: 'word',
+        selectionText: 'mitigate',
+        contextText: 'We mitigate the noise by doing less.',
+        entry: {
+          term: 'mitigate', partOfSpeech: 'verb',
+          definitionEn: 'make less severe', definitionZh: '减轻；缓和',
+          collocations: ['mitigate risk'],
+          examples: [{ en: 'Steps were taken to mitigate the damage.', zh: '采取了措施减轻损害。' }],
+          contextMeaning: '在这里指减少无关的干扰。',
+          provider: 'mock',
+        },
+      });
+      ok('加入生词本 → 201', vocab.status === 201, `实际 ${vocab.status}`);
+      vocabId = vocab.data.entry.id;
+      ok('生词记录来源文章与上下文',
+        vocab.data.entry.articleId === article.id
+        && vocab.data.entry.contextMeaning.includes('干扰'));
+      const vocabAgain = await req('POST', '/api/vocabulary', {
+        articleId: article.id,
+        term: 'Mitigate',
+        kind: 'word',
+        selectionText: 'Mitigate',
+        entry: { definitionZh: '另一个释义' },
+      });
+      ok('★ 同一个词再次加入会合并', vocabAgain.status === 200 && vocabAgain.data.merged === true);
+      ok('合并后收录次数累加', vocabAgain.data.entry.seenCount === 2);
+      const vocabNote = await req('PATCH', `/api/vocabulary/${vocabId}`, { note: '写作时常用' });
+      ok('可以给生词写备注', vocabNote.status === 200 && vocabNote.data.entry.note === '写作时常用');
+      ok('生词本能列出记录',
+        (await req('GET', '/api/vocabulary')).data.vocabulary.some((v) => v.id === vocabId));
+
+      const replaced = await req('PUT', `/api/articles/${article.id}/content`, {
+        text: '# A new draft\n\nOnly two paragraphs here.',
+        format: 'md',
+      });
+      ok('替换正文 → 200', replaced.status === 200);
+      ok('替换后统计更新',
+        replaced.data.article.paragraphCount === 2 && replaced.data.article.title === 'Doing Less');
+      ok('★ 替换正文会清空旧高亮与阅读位置',
+        replaced.data.article.highlights.length === 0
+        && replaced.data.article.progress.percent === 0);
+
+      const deleted = await req('DELETE', `/api/articles/${article.id}`);
+      ok('删除文章 → 200', deleted.status === 200);
+      ok('删除后详情 → 404', (await req('GET', `/api/articles/${article.id}`)).status === 404);
+      ok('★ 删除文章会清理正文文件', (await db.readArticleContent(article.id)).length === 0);
+      ok('★ 删除文章会清理文章对话', (await db.readArticleChat(article.id)).messages.length === 0);
+      articleId = null;
+
+      const vocabDeleted = await req('DELETE', `/api/vocabulary/${vocabId}`);
+      ok('删除生词 → 200', vocabDeleted.status === 200);
+      vocabId = null;
+    } finally {
+      if (articleId) await req('DELETE', `/api/articles/${articleId}`).catch(() => {});
+      if (vocabId) await req('DELETE', `/api/vocabulary/${vocabId}`).catch(() => {});
+      if (articleSettingsSnapshot !== null) await db.atomicWrite(articleSettingsFile, articleSettingsSnapshot);
+      else await fs.rm(articleSettingsFile, { force: true });
+      await req('GET', '/api/ai/status?refresh=1').catch(() => {});
+    }
+  }
+
   // ---------------------------------------------------------------- 设置与导出
   console.log('\n【设置与导出】');
   // 设置里可能存着用户真实的 Key。测试会临时写入假 Key，结束后必须原样恢复。
@@ -753,6 +1550,9 @@ async function main() {
     ok('导出 JSON → 200', exportJson.status === 200);
     ok('★ 导出文件里不含 API Key', !jsonText.includes('sk-test-not-real'));
     ok('导出内容可解析', (() => { try { JSON.parse(jsonText); return true; } catch { return false; } })());
+    const exported = JSON.parse(jsonText);
+    ok('★ JSON 导出包含学习项目',
+      Array.isArray(exported.projects) && exported.projects.some((p) => p.id === project.id));
     ok('导出带下载文件名', /attachment/.test(exportJson.headers.get('content-disposition') || ''));
 
     const exportMd = await fetch(`${BASE}/api/export?format=markdown`);
@@ -760,6 +1560,7 @@ async function main() {
     ok('导出 Markdown → 200', exportMd.status === 200);
     ok('Markdown 含任务清单', md.includes('## 任务'));
     ok('Markdown 含档案', md.includes('## 我的档案'));
+    ok('★ Markdown 含学习项目', md.includes('## 学习项目') && md.includes(project.title));
     ok('Markdown 标注了引擎来源', md.includes('本地模拟引擎'));
     ok('★ Markdown 里也没有 Key', !md.includes('sk-test-not-real'));
 
@@ -808,11 +1609,14 @@ async function main() {
     if (activeFocusSnapshot !== null) await db.atomicWrite(activeFocusFile, activeFocusSnapshot);
     else await fs.rm(activeFocusFile, { force: true });
   }
+  if (aliasesSnapshot !== null) await db.atomicWrite(aliasesFile, aliasesSnapshot);
+  else await fs.rm(aliasesFile, { force: true });
 
   const after = (await req('GET', '/api/bootstrap')).data;
   let removed = 0;
   for (const t of after.tasks) if (!beforeTaskIds.has(t.id)) { await req('DELETE', `/api/tasks/${t.id}`); removed += 1; }
   for (const p of after.plans) if (!beforePlanIds.has(p.id)) { await req('DELETE', `/api/plans/${p.id}`); removed += 1; }
+  for (const p of after.projects || []) if (!beforeProjectIds.has(p.id)) { await req('DELETE', `/api/projects/${p.id}`); removed += 1; }
   for (const a of after.archives) if (!beforeArchiveIds.has(a.id)) { await req('DELETE', `/api/archives/${a.id}`); removed += 1; }
   for (const c of after.conversations) if (!beforeConvIds.has(c.id)) { await req('DELETE', `/api/conversations/${c.id}`); removed += 1; }
   for (const id of [focusSessionId, yesterdayFocusSessionId, ...extraFocusSessionIds]) {
@@ -832,6 +1636,8 @@ async function main() {
   ok('★ 用户原有档案一份不少',
     finalState.archives.filter((a) => a.origin === 'legacy').length === userArchives.length,
     `${userArchives.length} → ${finalState.archives.filter((a) => a.origin === 'legacy').length}`);
+  ok('★ 没有留下测试学习项目', finalState.projects.length === beforeProjectIds.size,
+    `${beforeProjectIds.size} → ${finalState.projects.length}`);
 
   // ---------------------------------------------------------------- 结果
   console.log(`\n${'─'.repeat(56)}`);

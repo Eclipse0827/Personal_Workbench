@@ -82,9 +82,12 @@ function relativeDayLabel(key, todayKey, yesterdayKey) {
 }
 
 const CONTENT_COLORS = [
-  '#356b5b', '#c08a52', '#7d8c6a', '#b06a5f',
-  '#6f7f9c', '#9a7d9e', '#b39a49', '#5f8c8a',
+  '#5c4033', '#b97844', '#8b9d77', '#a85448',
+  '#6b7d5c', '#75a191', '#b39a49', '#9a7d62',
 ];
+
+/** 归类之后整页会重绘，用它把选中项接回来 */
+let pendingContentSelection = null;
 
 export default async function renderFocus(root, ctx) {
   let history = { sessions: [], stats: null };
@@ -144,7 +147,7 @@ export default async function renderFocus(root, ctx) {
 
   // ---------------------------------------------------------------- 统计与历史
 
-  page.appendChild(renderStats(stats, sessions, ctx, historyError));
+  page.appendChild(renderStats(stats, sessions, ctx, historyError, history.contentAliases));
 
   // 进行中时只更新表盘和按钮，不整页重绘
   if (active && runningView && root.isConnected) {
@@ -535,7 +538,7 @@ export default async function renderFocus(root, ctx) {
     } catch (err) { toastError(err); }
   }
 
-  function renderStats(s, list, ctx2, error) {
+  function renderStats(s, list, ctx2, error, contentAliasList) {
     const days = Array.isArray(s.byDay) ? s.byDay : [];
     const todayKey = s.todayKey || (days.length ? days[days.length - 1].date : '');
     const yesterdayKey = s.yesterdayKey || '';
@@ -544,9 +547,29 @@ export default async function renderFocus(root, ctx) {
     let selectedDate = todayDay && todayDay.sessions
       ? todayKey
       : (latestActive ? latestActive.date : todayKey);
-    let selectedContent = null;
 
     const allContent = Array.isArray(s.byContent) ? s.byContent : [];
+    const contentAliases = Array.isArray(contentAliasList) ? contentAliasList : [];
+    const aliasMap = new Map();
+    for (const entry of contentAliases) {
+      if (!entry) continue;
+      const from = contentKey(entry.from).toLowerCase();
+      const to = contentKey(entry.to);
+      if (from && to) aliasMap.set(from, to);
+    }
+    const resolveContentTitle = (title) => {
+      let current = contentKey(title);
+      const seen = new Set();
+      while (aliasMap.has(current.toLowerCase()) && !seen.has(current.toLowerCase())) {
+        seen.add(current.toLowerCase());
+        current = aliasMap.get(current.toLowerCase());
+      }
+      return current;
+    };
+
+    let selectedContent = pendingContentSelection ? resolveContentTitle(pendingContentSelection) : null;
+    pendingContentSelection = null;
+
     const colorMap = new Map();
     allContent.forEach((item, i) => {
       colorMap.set(contentKey(item.title), CONTENT_COLORS[i % CONTENT_COLORS.length]);
@@ -599,6 +622,47 @@ export default async function renderFocus(root, ctx) {
       });
     }
 
+    /** 当前选中那天的内容分布，饼图和悬停提示共用 */
+    function selectedDayModel() {
+      const day = days.find((d) => d.date === selectedDate) || null;
+      const items = day && Array.isArray(day.content) ? day.content : [];
+      const total = Number(day && day.seconds)
+        || items.reduce((n, item) => n + (Number(item.seconds) || 0), 0);
+      return { day, items, total };
+    }
+
+    /** 鼠标停在色块上：放大那一块，并在圆心写出它对应哪项专注 */
+    function setPieHover(title) {
+      const key = title ? contentKey(title).toLowerCase() : '';
+      const chart = pieWrap.querySelector('.focus-pie-svg');
+      if (chart) chart.classList.toggle('has-hover', Boolean(key));
+      pieWrap.classList.toggle('is-hovering', Boolean(key));
+      pieWrap.querySelectorAll('.focus-pie-seg').forEach((seg) => {
+        seg.classList.toggle('is-hovered', Boolean(key) && seg.getAttribute('data-key') === key);
+      });
+      legend.querySelectorAll('.focus-legend-row').forEach((row) => {
+        row.classList.toggle('is-hovered', Boolean(key) && row.getAttribute('data-key') === key);
+      });
+
+      const dot = pieWrap.querySelector('.focus-pie-hover-dot');
+      const name = pieWrap.querySelector('.focus-pie-hover-name');
+      const meta = pieWrap.querySelector('.focus-pie-hover-meta');
+      if (!dot || !name || !meta) return;
+      if (!key) {
+        dot.style.background = '';
+        name.textContent = '';
+        meta.textContent = '';
+        return;
+      }
+      const { items, total } = selectedDayModel();
+      const item = items.find((x) => contentKey(x.title).toLowerCase() === key);
+      if (!item) return;
+      const pct = total ? Math.round((Number(item.seconds) / total) * 100) : 0;
+      dot.style.background = colorFor(item.title);
+      name.textContent = item.title;
+      meta.textContent = `${spanText(item.seconds)} · ${pct}%`;
+    }
+
     function drawPie(items, total) {
       const circumference = 2 * Math.PI * 62;
       const circles = [
@@ -614,13 +678,18 @@ export default async function renderFocus(root, ctx) {
           if (seconds <= 0) continue;
           const length = circumference * (seconds / total);
           const gap = items.length > 1 ? Math.min(3, circumference * 0.008) : 0;
-          circles.push(svg('circle', {
+          const segment = svg('circle', {
             cx: '90', cy: '90', r: '62', fill: 'none',
+            class: 'focus-pie-seg',
+            'data-key': contentKey(item.title).toLowerCase(),
             stroke: colorFor(item.title), 'stroke-width': '24',
             'stroke-dasharray': `${Math.max(0.6, length - gap)} ${circumference}`,
             'stroke-dashoffset': String(-offset),
             transform: 'rotate(-90 90 90)',
-          }));
+          });
+          segment.addEventListener('mouseenter', () => setPieHover(item.title));
+          segment.addEventListener('mouseleave', () => setPieHover(null));
+          circles.push(segment);
           offset += length;
         }
       }
@@ -632,22 +701,32 @@ export default async function renderFocus(root, ctx) {
         'aria-label': '按专注内容划分的时间占比',
       }, circles);
       const center = h('div.focus-pie-center', {}, [
-        h('div.focus-pie-total', {}, [
-          h('strong', {}, total > 0 ? (minutes < 1 ? '<1' : String(Math.round(minutes))) : '0'),
-          h('span', {}, '分钟'),
+        h('div.focus-pie-default', {}, [
+          h('div.focus-pie-total', {}, [
+            h('strong', {}, total > 0 ? (minutes < 1 ? '<1' : String(Math.round(minutes))) : '0'),
+            h('span', {}, '分钟'),
+          ]),
+          h('div.focus-pie-caption', {}, total > 0 ? '这一天' : '还没有记录'),
         ]),
-        h('div.focus-pie-caption', {}, total > 0 ? '这一天' : '还没有记录'),
+        h('div.focus-pie-hover', {}, [
+          h('span.focus-pie-hover-dot'),
+          h('span.focus-pie-hover-name'),
+          h('span.focus-pie-hover-meta'),
+        ]),
       ]);
       return [chart, center];
     }
 
     function legendRow(item, total) {
-      const active = selectedContent && contentKey(selectedContent) === contentKey(item.title);
+      const active = selectedContent && contentKey(selectedContent).toLowerCase() === contentKey(item.title).toLowerCase();
       const pct = total ? Math.round((Number(item.seconds) / total) * 100) : 0;
       return h(`button.focus-legend-row${active ? '.active' : ''}`, {
         type: 'button',
         title: '点一下，查看这项内容一共花了多久',
+        'data-key': contentKey(item.title).toLowerCase(),
         onclick: () => pickContent(item.title),
+        onmouseenter: () => setPieHover(item.title),
+        onmouseleave: () => setPieHover(null),
       }, [
         h('span.focus-legend-dot', { style: { background: colorFor(item.title) } }),
         h('span.focus-legend-name', {}, item.title),
@@ -657,7 +736,7 @@ export default async function renderFocus(root, ctx) {
     }
 
     function contentRow(item) {
-      const active = selectedContent && contentKey(selectedContent) === contentKey(item.title);
+      const active = selectedContent && contentKey(selectedContent).toLowerCase() === contentKey(item.title).toLowerCase();
       return h(`button.focus-content-row${active ? '.active' : ''}`, {
         type: 'button',
         onclick: () => pickContent(item.title),
@@ -673,9 +752,112 @@ export default async function renderFocus(root, ctx) {
     }
 
     function pickContent(title) {
-      const key = contentKey(title);
-      selectedContent = selectedContent && contentKey(selectedContent) === key ? null : title;
+      const key = contentKey(title).toLowerCase();
+      selectedContent = selectedContent && contentKey(selectedContent).toLowerCase() === key ? null : title;
       paintChart();
+    }
+
+    /** 这一类下面已经并进来的写法（来自归类关系，不改原始记录） */
+    function mergedFrom(item) {
+      const target = contentKey(item.title).toLowerCase();
+      return contentAliases.filter((entry) =>
+        entry && contentKey(resolveContentTitle(entry.to)).toLowerCase() === target);
+    }
+
+    function mergeTargets(item) {
+      const currentKey = contentKey(item.title).toLowerCase();
+      const used = new Set([currentKey]);
+      const tasks = [];
+      const contents = [];
+      for (const task of (Array.isArray(state.tasks) ? state.tasks : [])) {
+        const title = resolveContentTitle(task.title);
+        const key = title.toLowerCase();
+        if (used.has(key)) continue;
+        used.add(key);
+        tasks.push({ title, done: task.status === 'done' });
+      }
+      for (const other of allContent) {
+        const title = resolveContentTitle(other.title);
+        const key = title.toLowerCase();
+        if (used.has(key)) continue;
+        used.add(key);
+        contents.push({ title });
+      }
+      return { tasks, contents };
+    }
+
+    function mergeControls(item) {
+      const { tasks, contents } = mergeTargets(item);
+      if (!tasks.length && !contents.length) {
+        return h('div.focus-merge', {}, [
+          h('div.focus-merge-label', {}, '把这一项归到'),
+          h('p.focus-merge-hint.tiny.muted.mb0', {}, '还没有别的待办或内容可以归入。先建一条待办，再来这里合并。'),
+        ]);
+      }
+
+      const select = h('select.focus-merge-select', {
+        'aria-label': '选择要归到的待办或内容',
+      }, [
+        h('option', { value: '' }, '选一项待办或内容…'),
+        tasks.length
+          ? h('optgroup', { label: '待办' }, tasks.map((t) =>
+              h('option', { value: t.title }, t.done ? `${t.title}（已完成）` : t.title)))
+          : null,
+        contents.length
+          ? h('optgroup', { label: '其他专注内容' }, contents.map((t) =>
+              h('option', { value: t.title }, t.title)))
+          : null,
+      ]);
+      const button = h('button.btn.small.focus-merge-btn', { type: 'button' }, '归类');
+      button.addEventListener('click', async () => {
+        if (!select.value) {
+          toast('先选一项要归到的待办。', 'warn');
+          select.focus();
+          return;
+        }
+        button.disabled = true;
+        try {
+          const res = await api.mergeFocusContent({ from: item.title, to: select.value });
+          const target = res && res.alias ? res.alias.to : select.value;
+          pendingContentSelection = target;
+          toast(`已把「${item.title}」归到「${target}」。`);
+          await ctx.rerender();
+        } catch (err) {
+          button.disabled = false;
+          toastError(err);
+        }
+      });
+
+      return h('div.focus-merge', {}, [
+        h('div.focus-merge-label', {}, '把这一项归到'),
+        h('div.focus-merge-row', {}, [select, button]),
+        h('p.focus-merge-hint.tiny.muted.mb0', {}, '归类后，时长会合并成一行；原始专注记录不会被删，随时可以取消。'),
+      ]);
+    }
+
+    function aliasChips(item) {
+      const merged = mergedFrom(item);
+      if (!merged.length) return null;
+      return h('div.focus-alias-chips', {}, [
+        h('span.focus-alias-label', {}, '已并入'),
+        ...merged.map((alias) =>
+          h('span.focus-alias-chip', {}, [
+            h('span', {}, alias.from),
+            h('button.focus-alias-remove', {
+              type: 'button',
+              title: `把「${alias.from}」单独列出`,
+              'aria-label': `取消归类 ${alias.from}`,
+              onclick: async () => {
+                try {
+                  await api.unmergeFocusContent({ from: alias.from });
+                  pendingContentSelection = alias.from;
+                  toast(`「${alias.from}」已单独列出。`);
+                  await ctx.rerender();
+                } catch (err) { toastError(err); }
+              },
+            }, '×'),
+          ]))
+      ]);
     }
 
     function paintContent() {
@@ -686,11 +868,12 @@ export default async function renderFocus(root, ctx) {
       }
 
       if (selectedContent) {
-        const item = allContent.find((x) => contentKey(x.title) === contentKey(selectedContent));
+        const key = contentKey(selectedContent).toLowerCase();
+        const item = allContent.find((x) => contentKey(x.title).toLowerCase() === key);
         if (!item) {
           selectedContent = null;
         } else {
-          contentPick.replaceChildren(
+          contentPick.replaceChildren(...[
             h('div.focus-picked-head', {}, [
               h('span.focus-picked-label', {}, '已选中'),
               h('button.focus-picked-clear', {
@@ -700,8 +883,10 @@ export default async function renderFocus(root, ctx) {
             ]),
             h('div.focus-picked-title', {}, item.title),
             h('div.focus-picked-total', {}, `全部累计 ${spanText(item.seconds)} · ${item.sessions} 次`),
-            h('div.tiny.muted', {}, `最近一次 ${timeLabel(item.lastAt)}`)
-          );
+            h('div.tiny.muted', {}, `最近一次 ${timeLabel(item.lastAt)}`),
+            aliasChips(item),
+            mergeControls(item),
+          ].filter(Boolean));
           return;
         }
       }
@@ -719,8 +904,11 @@ export default async function renderFocus(root, ctx) {
         ]));
         return;
       }
+      const selectedKey = selectedContent ? contentKey(selectedContent).toLowerCase() : '';
       const filtered = selectedContent
-        ? list.filter((session) => session.mode !== 'break' && contentKey(session.title) === contentKey(selectedContent))
+        ? list.filter((session) =>
+            session.mode !== 'break'
+            && contentKey(resolveContentTitle(session.title)).toLowerCase() === selectedKey)
         : list;
       const shown = filtered.slice(0, 12);
       historyLabel.textContent = selectedContent ? `「${selectedContent}」的记录` : '最近专注';
@@ -733,14 +921,11 @@ export default async function renderFocus(root, ctx) {
           : '还没有记录。完成第一轮后，会在这里看到。'));
         return;
       }
-      historyHost.replaceChildren(...shown.map((session) => historyRow(session, ctx2)));
+      historyHost.replaceChildren(...shown.map((session) => historyRow(session, ctx2, resolveContentTitle)));
     }
 
     function paintChart() {
-      const day = days.find((d) => d.date === selectedDate) || null;
-      const items = day && Array.isArray(day.content) ? day.content : [];
-      const total = Number(day && day.seconds)
-        || items.reduce((n, item) => n + (Number(item.seconds) || 0), 0);
+      const { items, total } = selectedDayModel();
 
       chartRange.replaceChildren(
         h('strong', {}, relativeDayLabel(selectedDate, todayKey, yesterdayKey)),
@@ -763,6 +948,7 @@ export default async function renderFocus(root, ctx) {
       } else {
         legend.replaceChildren(...items.map((item) => legendRow(item, total)));
       }
+      setPieHover(null);
       paintBars();
       paintContent();
       paintHistory();
@@ -829,19 +1015,23 @@ export default async function renderFocus(root, ctx) {
     return h('div.section.focus-below', {}, [statsGrid, timeMap, historyCard]);
   }
 
-  function historyRow(session, ctx2) {
+  function historyRow(session, ctx2, resolveTitle) {
     const plan = session.planId ? planById(session.planId) : null;
     const isBreak = session.mode === 'break';
     const canUndo = session.autoCompleted && !session.undoneAt && session.taskCompleted && session.taskId;
+    const rawTitle = session.title || (isBreak ? '休息' : '专注');
+    const shownTitle = isBreak || typeof resolveTitle !== 'function' ? rawTitle : resolveTitle(rawTitle);
+    const mergedFrom = contentKey(shownTitle).toLowerCase() !== contentKey(rawTitle).toLowerCase() ? rawTitle : null;
     return h('div.focus-history-row', {}, [
       h('div.focus-history-time', {}, [
         h('div', {}, timeLabel(session.endedAt)),
         h('div.tiny.muted', {}, durationLabel(session)),
       ]),
       h('div.focus-history-main', {}, [
-        h('div.focus-history-title', {}, session.title || (isBreak ? '休息' : '专注')),
+        h('div.focus-history-title', {}, shownTitle),
         h('div.focus-history-meta', {}, [
           isBreak ? h('span.tag.warm', {}, '休息') : h('span.tag.accent', {}, '专注'),
+          mergedFrom ? h('span.tag', {}, `原「${mergedFrom}」`) : null,
           plan ? h('span.tag', {}, plan.title) : null,
           endedEarly(session) ? h('span.tag', {}, '提前结束') : null,
           session.autoCompleted

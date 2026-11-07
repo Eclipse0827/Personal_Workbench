@@ -697,7 +697,7 @@ function pickKeySentences(text, limit = 6) {
 
 function pickPitfalls(text) {
   return sentencesOf(text)
-    .filter((s) => /(注意|切忌|不能|必须|区分|区别|容易|误区|特别要)/.test(s))
+    .filter((s) => /(注意|切忌|不能|区分|区别|容易|误区|特别要)/.test(s))
     .slice(0, 3)
     .map((s) => oneLine(s, 150));
 }
@@ -706,9 +706,178 @@ function pickExample(paragraphs) {
   return paragraphs.find((p) => /^(例|例题|例如|比如)|例如|比如/.test(p) && p.length >= 20) || null;
 }
 
-function localLesson({ bookTitle, chapterTitle, section, text, textInfo = null }) {
-  const clean = normalizeText(text);
+// ================================================================ 章节知识地图
+
+function readableTextInRange(pages, start, end) {
+  return stripRunningHeaders(
+    pages.filter((p) => p.page >= start && p.page <= end)
+  )
+    .filter(isPageReadable)
+    .map((p) => p.text)
+    .join('\n\n');
+}
+
+function mapTitleVariants(title) {
+  const raw = String(title || '').trim();
+  if (!raw) return [];
+  const out = [raw];
+  const bare = raw.replace(/^第\s*[0-9一二三四五六七八九十百千零〇两]+\s*[章节篇部]\s*/, '').trim();
+  if (bare && bare !== raw) out.push(bare);
+  return out;
+}
+
+function stripLeadingHeadings(text, titles) {
+  const known = new Set(titles.flatMap(mapTitleVariants));
+  const lines = String(text || '').split('\n');
+  const isHeading = (line) => {
+    const s = line.trim();
+    if (!s) return true;
+    if (known.has(s)) return true;
+    if (s.length <= 30 && /^第\s*[0-9一二三四五六七八九十百千零〇两]+\s*[章节篇部]/.test(s) && !/[。！？；]/.test(s)) return true;
+    if (s.length <= 30 && /^\d+(?:\.\d+){1,3}\s+\S/.test(s) && !/[。！？；]/.test(s)) return true;
+    return false;
+  };
+  let i = 0;
+  while (i < lines.length && isHeading(lines[i])) i += 1;
+  return lines.slice(i).join('\n').trim();
+}
+
+function cleanMapPoint(text, titles) {
+  let s = String(text || '').replace(/\s+/g, ' ').trim();
+  s = s.replace(/^[\d.、．\s]+/, '');
+  const known = titles.flatMap(mapTitleVariants);
+  for (let i = 0; i < 4; i += 1) {
+    const hit = known
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)
+      .find((title) => s === title || s.startsWith(`${title} `));
+    if (!hit) break;
+    s = s.slice(hit.length).trim();
+  }
+  return s.replace(/^[：:，,、；;\s]+/, '');
+}
+
+function mapPointKey(text) {
+  return String(text || '')
+    .replace(/是指|指的是|称为|称作|叫做|定义为|是一种|是|称/g, '')
+    .replace(/[^\u4e00-\u9fa5A-Za-z0-9]/g, '')
+    .slice(0, 30);
+}
+
+function uniqueMapPoints(list, limit, titles) {
+  const keys = [];
+  const out = [];
+  for (const item of list || []) {
+    const text = cleanMapPoint(item, titles);
+    const key = mapPointKey(text);
+    if (!text || !key) continue;
+    const dup = keys.some((prev) => prev === key
+      || (key.length >= 12 && prev.length >= 12 && (prev.includes(key) || key.includes(prev))));
+    if (dup) continue;
+    keys.push(key);
+    out.push(text);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function chapterMapPoints(section, text, chapterTitle = '') {
+  const titles = [chapterTitle, section.title, ...(section.subsections || []).map((x) => x.title)].filter(Boolean);
+  const body = stripLeadingHeadings(text, titles);
+  if (!body) {
+    return (section.subsections || []).slice(0, 3).map((x) => x.title);
+  }
+  const defs = extractDefinitions(body)
+    .filter((d) => !/^(什么|第|本章|这一|本节|生活|例如|比如|常见|通常|一般|其中|我们|你|它|这)/.test(d.term))
+    .filter((d) => d.term.length > 2
+      || !titles.some((title) => title.length > d.term.length && title.endsWith(d.term)))
+    .slice(0, 2)
+    .map((d) => oneLine(d.sentence, 90));
+  const keys = pickKeySentences(body, 4)
+    .filter((s) => !/^(生活里|例如|比如|举个例子|可见|总之)/.test(s.trim()))
+    .map((s) => oneLine(s, 90));
+  const points = uniqueMapPoints([...defs, ...keys], 3, titles);
+  if (points.length) return points;
+  return (section.subsections || []).slice(0, 3).map((x) => x.title);
+}
+
+/**
+ * 每章一张「知识点地图」：章节是根，小节是分支，每节带 2-3 个从原文抽出的要点。
+ * 这是本地规则抽取，不是模型生成；地图只负责帮读者建立顺序感，具体讲解仍在讲义里。
+ */
+function buildChapterGuides(book, pages) {
+  const out = {};
+  const list = Array.isArray(pages) ? pages : [];
+  for (const chapter of book.chapters || []) {
+    const nodes = (chapter.sections || []).map((section) => ({
+      sectionId: section.id,
+      title: section.title,
+      pages: `${section.pageStart}–${section.pageEnd}`,
+      points: chapterMapPoints(section, readableTextInRange(list, section.pageStart, section.pageEnd), chapter.title),
+    }));
+    const introEnd = nodes.length && chapter.sections[0]
+      ? Math.max(chapter.pageStart, chapter.sections[0].pageStart - 1)
+      : chapter.pageEnd;
+    const introText = readableTextInRange(list, chapter.pageStart, introEnd);
+    const introHeadings = [chapter.title, ...(chapter.sections || []).map((s) => s.title)];
+    const opening = toParagraphs(stripLeadingHeadings(introText, introHeadings))
+      .find((p) => p.length >= 20 && !/^第\s*\d+\s*章/.test(p)) || '';
+    const titles = nodes.map((n) => n.title).join(' → ');
+    const overview = opening
+      ? `本章先交代：${oneLine(opening, 130)} 下面按 ${nodes.length} 节展开，先看每节的关键结论，再回到原文核对细节。`
+      : `本章分 ${nodes.length} 节：${titles}。先看每节的关键结论，再按顺序读原文。`;
+    out[chapter.id] = {
+      provider: 'local',
+      model: null,
+      generatedAt: db.nowIso(),
+      overview,
+      thread: uniqueMapPoints(nodes.flatMap((n) => n.points), 4, [])
+        .map((p) => p.replace(/[。；;，,、\s]+$/, '')),
+      nodes,
+      note: '知识点由本地规则从章节原文抽取，不是模型生成。',
+    };
+  }
+  return out;
+}
+
+async function ensureChapterGuides(book) {
+  const chapters = book.chapters || [];
+  if (!chapters.length) return book;
+  const existing = book.chapterGuides || {};
+  if (chapters.every((c) => existing[c.id])) return book;
+  const pages = await db.readTextbookPages(book.id);
+  book.chapterGuides = { ...existing, ...buildChapterGuides(book, pages) };
+  await db.put('textbooks', book);
+  return book;
+}
+
+function stepTitleFromParagraph(text, index, term = '') {
+  if (index === 0 && term) return `先弄清「${term}」`.slice(0, 24);
+  const clause = String(text || '')
+    .split(/[。！？；：]/)[0]
+    .split(/[，,、]/)[0]
+    .trim();
+  if (/^(生活里|例如|比如|举个|一个常见)/.test(clause)) return '一个生活里的例子';
+  const short = clause
+    .replace(/^(因此|所以|但是|不过|另外|理解|按照|生活里|从|在)/, '')
+    .trim();
+  if (!short) return `第 ${index + 1} 步`;
+  return short.length > 18 ? `${short.slice(0, 18)}…` : short;
+}
+
+function localLesson({ bookTitle, chapterTitle, section, text, textInfo = null, previous = null, next = null }) {
+  const raw = normalizeText(text);
+  const clean = stripLeadingHeadings(raw, [
+    chapterTitle,
+    section.title,
+    ...(section.subsections || []).map((x) => x.title),
+  ]) || raw;
   const charCount = clean.replace(/\s/g, '').length;
+  const position = [
+    previous ? `前面读的是「${previous.title}」` : '这是本章的第一节',
+    next ? `后面接着讲「${next.title}」` : '也是本章的最后一节',
+    `把这一节放回「${chapterTitle}」的这条线里看：先弄清它要回答的问题，再跟着原文往下推。`,
+  ].join('，');
   if (charCount < 12 || ocr.isLikelyGarbled(clean)) {
     const unreadable = textInfo && Array.isArray(textInfo.unreadablePages) && textInfo.unreadablePages.length
       ? `这一节有 ${textInfo.unreadablePages.length} 页没有可靠文字。`
@@ -720,6 +889,8 @@ function localLesson({ bookTitle, chapterTitle, section, text, textInfo = null }
       provider: 'local',
       model: null,
       generatedAt: db.nowIso(),
+      position,
+      thread: [],
       overview: `${ocrHint}${unreadable}这可能是扫描页、整页公式/图片，或者页码区间不准确。请对照「PDF 原页」阅读，不要根据乱码文字硬凑讲解。`,
       keyPoints: [],
       blocks: [],
@@ -733,23 +904,31 @@ function localLesson({ bookTitle, chapterTitle, section, text, textInfo = null }
 
   const short = charCount < 120;
   const paragraphs = toParagraphs(clean);
-  const defs = extractDefinitions(clean);
-  const keys = pickKeySentences(clean, 6);
+  const sectionTitles = [chapterTitle, section.title, ...(section.subsections || []).map((x) => x.title)].filter(Boolean);
+  const defs = extractDefinitions(clean)
+    .filter((d) => !/^(什么|第|本章|这一|本节|生活|例如|比如|常见|通常|一般|其中|我们|你|它|这)/.test(d.term))
+    .filter((d) => d.term.length > 2
+      || !sectionTitles.some((title) => title.length > d.term.length && title.endsWith(d.term)));
+  const keys = pickKeySentences(clean, 6)
+    .filter((s) => !/^(生活里|例如|比如|举个例子|可见|总之)/.test(s.trim()))
+    .filter((s) => s.replace(/\s/g, '').length >= 12 && !/^第[一二三四五六七八九十\d]+[，,、]/.test(s.trim()));
   const pitfalls = pickPitfalls(clean);
   const example = pickExample(paragraphs);
   const displayTitle = section.wholeChapter ? chapterTitle : section.title;
   const firstPara = paragraphs[0] ? oneLine(paragraphs[0], 220) : '';
   const subsectionTitles = (section.subsections || []).slice(0, 6).map((x) => x.title);
 
+  const thread = paragraphs.slice(0, 4).map((p, i) => ({
+    title: stepTitleFromParagraph(p, i, i === 0 && defs[0] ? defs[0].term : ''),
+    body: p,
+  }));
+  if (!thread.length) thread.push({ title: '先读原文', body: oneLine(clean, 400) });
+
   const overview = [
     `这一节（${displayTitle}，第 ${section.pageStart}–${section.pageEnd} 页）共提取到约 ${clean.replace(/\s/g, '').length} 字。`,
-    firstPara ? `原文开头在讲：${firstPara}` : '',
+    thread.length > 1 ? `下面按原文顺序拆成 ${thread.length} 步，先弄清概念，再看它怎么展开。` : '',
     subsectionTitles.length ? `可以按这几个小标题读：${subsectionTitles.join('；')}。` : '',
   ].filter(Boolean).join('\n\n');
-
-  const block1 = paragraphs.slice(0, 2).map((p) => oneLine(p, 260)).join('\n\n');
-  const block2 = defs.slice(0, 4).map((d) => `- ${d.sentence}`).join('\n') || keys.slice(0, 3).map((k) => `- ${k}`).join('\n');
-  const block3 = keys.slice(0, 4).map((k) => `- ${k}`).join('\n');
 
   const questions = [];
   for (const d of defs.slice(0, 2)) {
@@ -757,17 +936,17 @@ function localLesson({ bookTitle, chapterTitle, section, text, textInfo = null }
   }
   questions.push('这一节的核心结论是什么？如果把条件改掉，结论还成立吗？');
 
+  const blocks = [];
+
   return {
     provider: 'local',
     model: null,
     generatedAt: db.nowIso(),
+    position,
+    thread,
     overview,
     keyPoints: keys,
-    blocks: [
-      { heading: '这一节在讲什么', body: block1 || overview },
-      { heading: '概念与结论', body: block2 },
-      { heading: '顺着原文再读一遍', body: block3 },
-    ].filter((b) => b.body),
+    blocks,
     example: example ? oneLine(example, 400) : null,
     pitfalls,
     summary: keys[0] || firstPara || '先读原文，再把这一节的核心概念用自己的话复述一遍。',
@@ -789,6 +968,13 @@ function validateLesson(raw, provider, model) {
       })).filter((b) => b.body)
     : [];
 
+  const thread = Array.isArray(raw.thread)
+    ? raw.thread.slice(0, 8).map((step) => ({
+        title: str(step && step.title, 80),
+        body: str(step && step.body, 3000),
+      })).filter((step) => step.title && step.body)
+    : [];
+
   const terms = Array.isArray(raw.terms)
     ? raw.terms.slice(0, 6).map((t) => ({
         term: str(t && t.term, 40),
@@ -801,6 +987,8 @@ function validateLesson(raw, provider, model) {
     provider,
     model: model || null,
     generatedAt: db.nowIso(),
+    position: str(raw.position, 1200),
+    thread,
     overview: str(raw.overview, 2000),
     keyPoints: arr(raw.keyPoints, 8, 500),
     blocks,
@@ -818,32 +1006,43 @@ function validateLesson(raw, provider, model) {
   return lesson;
 }
 
-const LESSON_SYSTEM = `你是一位大学教材精读助教。你的任务是把一节教材内容讲清楚，帮助学生真正理解，而不是复述目录或堆砌套话。
+const LESSON_SYSTEM = `你是一位大学教材精读助教。你的任务是把一节教材讲成一条能顺着读下去的学习路径，而不是复述目录、堆砌要点或写成百科词条。
 规则：
 1. 只依据提供的教材原文讲解。原文不足以支撑时，明确写「这一节提取的文字里没有展开」，不要编造公式、页码、作者观点。
-2. 面向大学生，用中文讲。先给整体思路，再解释概念之间的因果关系，最后指出易错点。
-3. 公式用可读的纯文本表示；不要输出 LaTeX 专用命令。不要输出 HTML。
-4. 讲义以教材文字为唯一主线。页面上的动画只是可选辅助，不要用动画替代讲解，也不要把「先看动画」写成学习步骤。
-5. 输出一个 JSON 对象，不要 markdown 代码块，不要额外解释。结构：
+2. 讲解要有先后顺序：先说明这一节接在什么内容之后、要解决什么问题，再按「问题 → 关键概念 → 推理/关系 → 结论」一步步推进。每一步都交代「为什么现在讲这个」。
+3. 面向大学生，用中文讲。句子之间要有承接关系，不要把要点排成互不相干的清单。
+4. 公式用可读的纯文本表示；不要输出 LaTeX 专用命令。不要输出 HTML。
+5. 讲义以教材文字为唯一主线。页面上的动画只是可选辅助，不要用动画替代讲解，也不要把「先看动画」写成学习步骤。
+6. 输出一个 JSON 对象，不要 markdown 代码块，不要额外解释。结构：
 {
-  "overview": "2-4 句，说明这一节在解决什么问题、和前后内容的关系",
-  "keyPoints": ["4-6 条真正重要的结论或概念"],
-  "blocks": [{"heading": "小标题", "body": "用 markdown 写的讲解，2-4 段；可用 - 列表"}],
+  "position": "1-2 句：这一节在整章中的位置，承接上一节什么内容、为下一节留下什么",
+  "overview": "2-3 句路线图：这一节准备先讲什么、再讲什么、最后落到什么结论",
+  "thread": [
+    {"title": "第 1 步的短标题（不超过 16 字）", "body": "1-2 段：这一步要解决的问题和关键概念，用因果词承接"},
+    {"title": "第 2 步的短标题", "body": "继续往下推，不要换成并列要点"}
+  ],
+  "keyPoints": ["3-6 条读完必须记住的结论"],
+  "blocks": [{"heading": "需要另外展开的主题", "body": "用 markdown 写的补充讲解；不要重复 thread 里已经讲过的话"}],
   "example": "一个来自原文或贴合原文的简短例子；没有就写空字符串",
   "pitfalls": ["容易混淆或算错的地方"],
-  "summary": "一句话总结",
+  "summary": "一句话收束这一节",
   "questions": ["2-3 个自测问题"],
   "terms": [{"term": "这一节里生涩的专业词汇", "plain": "用大白话解释它是什么、在这里起什么作用", "example": "一个日常生活里的类比"}]
-}`;
+}
+thread 通常 3-5 步，必须是一条连续的解释链；blocks 只在确实需要补充公式、分类或对比时才写，可以留空数组。`;
 
-async function generateLesson({ settings, book, chapter, section, text, textInfo = null }) {
+async function generateLesson({ settings, book, chapter, section, text, textInfo = null, previous = null, next = null }) {
   const excerpt = normalizeText(text).slice(0, MAX_SECTION_LLM_CHARS);
+  const prevSection = previous && (previous.section || previous);
+  const nextSection = next && (next.section || next);
   const local = localLesson({
     bookTitle: book.title,
     chapterTitle: chapter.title,
     section,
     text,
     textInfo,
+    previous: prevSection,
+    next: nextSection,
   });
 
   if (!isUsableText(text)) return local;
@@ -856,13 +1055,15 @@ async function generateLesson({ settings, book, chapter, section, text, textInfo
   const prompt = [
     `教材：《${book.title}》`,
     `章节：${chapter.title} / ${section.title}`,
+    prevSection ? `上一节：${prevSection.title}` : '这是本章第一节，前面没有同章小节。',
+    nextSection ? `下一节：${nextSection.title}` : '这是本章最后一节。',
     `页码范围：第 ${section.pageStart}–${section.pageEnd} 页`,
     ocrNote,
     '',
     '教材原文（由 PDF 提取，可能有断行、页眉和公式失真）：',
     excerpt,
     '',
-    '请按规定的 JSON 结构输出这一节的精读讲义。terms 只挑 2-4 个这一节里真正难懂的专业词，用生活里的例子解释。',
+    '请按规定的 JSON 结构输出这一节的精读讲义。先在 position 里交代前后衔接，再用 thread 一步步讲清因果，不要写成并列要点。terms 只挑 2-4 个这一节里真正难懂的专业词，用生活里的例子解释。',
   ].filter(Boolean).join('\n');
 
   try {
@@ -1054,6 +1255,113 @@ async function answerWithModel({ settings, book, chapter, section, lesson, text,
   };
 }
 
+// ================================================================ 图解
+
+const DIAGRAM_SYSTEM = `你是教材精读里的图解助手。学生问了一个概念问题，你要把解释整理成一张能直接画成方框和箭头的流程图。
+规则：
+1. 只依据提供的教材原文；原文没有展开时，明确在 note 里说，不要编造。
+2. 每一步只讲一个动作、状态或概念，前后用箭头能连起来。
+3. 用中文；label 不超过 14 个字，detail 用 1-2 句解释，不要写 markdown、LaTeX 或 HTML。
+4. 输出 JSON，不要代码块，不要额外解释：
+{"title": "这张图在讲什么", "steps": [{"label": "短标签", "detail": "这一步的解释"}], "note": "阅读提示或原文限制"}
+steps 3-6 步，必须是同一条因果链，不要写成并列清单。`;
+
+function validateDiagram(raw, provider, model) {
+  if (!raw || typeof raw !== 'object') return null;
+  const str = (v, n) => (typeof v === 'string' ? v.trim().slice(0, n) : '');
+  const steps = Array.isArray(raw.steps)
+    ? raw.steps.slice(0, 6).map((s) => ({
+        label: str(s && s.label, 40),
+        detail: str(s && s.detail, 500),
+      })).filter((s) => s.label)
+    : [];
+  if (!steps.length) return null;
+  return {
+    provider,
+    model: model || null,
+    title: str(raw.title, 100) || '把这个问题串成一条线',
+    steps,
+    note: str(raw.note, 600),
+  };
+}
+
+function localDiagram({ section, lesson, text, question }) {
+  let steps = [];
+  if (lesson && Array.isArray(lesson.thread) && lesson.thread.length) {
+    steps = lesson.thread.slice(0, 6).map((step) => ({
+      label: oneLine(step.title, 22),
+      detail: oneLine(step.body, 260),
+    }));
+  }
+  if (!steps.length && lesson && Array.isArray(lesson.keyPoints) && lesson.keyPoints.length) {
+    steps = lesson.keyPoints.slice(0, 5).map((point) => ({
+      label: oneLine(point, 26),
+      detail: '',
+    }));
+  }
+  if (!steps.length && isUsableText(text)) {
+    steps = pickKeySentences(text, 4).map((point) => ({
+      label: oneLine(point, 26),
+      detail: '',
+    }));
+  }
+  if (!steps.length) {
+    steps = [
+      { label: '先读原文', detail: '这一节没有足够的可靠文字，先对照 PDF 原页确认页码和图示。' },
+      { label: '再抓概念', detail: '把标题里的关键词圈出来，看它在原文里对应哪一段。' },
+    ];
+  }
+  const title = question
+    ? `把「${oneLine(question, 24)}」串成一条线`
+    : `${section.title}：一步一步看`;
+  return {
+    provider: 'local',
+    model: null,
+    title,
+    steps,
+    note: '这张图由本地规则从本节讲义或原文抽取，不是模型生成的图解；只用来理清先后顺序。',
+  };
+}
+
+async function generateDiagram({ settings, book, chapter, section, lesson, text, question }) {
+  const local = localDiagram({ section, lesson, text, question });
+  if (settings.aiProvider === 'mock' || !isUsableText(text)) return local;
+
+  const paragraphs = toParagraphs(text);
+  const relevant = rankParagraphs(paragraphs, question, 4);
+  const excerpt = relevant.length ? relevant.join('\n\n') : chatExcerpt(text);
+  const context = [
+    `教材：《${book.title}》`,
+    `当前小节：${chapter.title} / ${section.title}`,
+    lesson ? `本节摘要：${oneLine(lesson.summary || lesson.overview, 700)}` : '',
+    '',
+    '与本问题最相关的教材原文：',
+    normalizeText(excerpt).slice(0, MAX_CHAT_EXCERPT_CHARS),
+    '',
+    `学生的问题：${question || '把这一节的核心概念串成流程图'}`,
+  ].filter(Boolean).join('\n');
+
+  try {
+    const out = await complete({
+      settings,
+      system: DIAGRAM_SYSTEM,
+      user: context,
+      temperature: 0.25,
+      maxTokens: 1200,
+      timeoutMs: settings.aiProvider === 'ollama' ? 150000 : 60000,
+    });
+    const parsed = parseJson(out.text);
+    const diagram = validateDiagram(parsed, out.provider, out.model);
+    if (!diagram) throw new Error('模型返回的图解结构不可用');
+    return diagram;
+  } catch (err) {
+    return {
+      ...local,
+      warning: `模型这次没有画成图，已用本地整理。原因：${err.message}`,
+    };
+  }
+}
+
 // ================================================================ 书籍记录
 
 function bookSummary(book) {
@@ -1115,6 +1423,15 @@ function nextSection(book, sectionId) {
   }
   const i = list.findIndex((x) => x.section.id === sectionId);
   return i >= 0 ? list[i + 1] || null : null;
+}
+
+function previousSection(book, sectionId) {
+  const list = [];
+  for (const chapter of book.chapters || []) {
+    for (const section of chapter.sections || []) list.push({ chapter, section });
+  }
+  const i = list.findIndex((x) => x.section.id === sectionId);
+  return i > 0 ? list[i - 1] : null;
 }
 
 function refreshProgress(book) {
@@ -1638,6 +1955,7 @@ async function analyze(bookId, settings) {
       : ocrReadable.length ? 'ocr' : 'pdf';
 
     book.chapters = chapters;
+    book.chapterGuides = buildChapterGuides(book, pages);
     refreshProgress(book);
     book.status = 'ready';
     book.statusMessage = '';
@@ -1799,11 +2117,16 @@ module.exports = {
   findSection,
   firstSection,
   nextSection,
+  previousSection,
+  buildChapterGuides,
+  ensureChapterGuides,
   countSections,
   refreshProgress,
   analyze,
   generateLesson,
   answerWithModel,
+  generateDiagram,
+  localDiagram,
   buildGuide,
   sectionPayload,
   providerLabel,

@@ -13,12 +13,13 @@ import renderTasks from './views/tasks.js';
 import renderPlanDetail from './views/plan-detail.js';
 import renderChatList from './views/chat-list.js';
 import renderChat from './views/chat.js';
-import renderArchive from './views/archive.js';
-import renderArchiveDetail from './views/archive-detail.js';
 import renderFocus from './views/focus.js';
 import renderTextbooks from './views/textbooks.js';
 import renderTextbook from './views/textbook.js';
-import renderTools from './views/tools.js';
+import renderArticles from './views/articles.js';
+import renderArticle from './views/article.js';
+import renderProjects from './views/projects.js';
+import renderProjectDetail from './views/project-detail.js';
 import renderSettings from './views/settings.js';
 
 // ---------------------------------------------------------------- 路由表
@@ -28,13 +29,14 @@ const ROUTES = [
   { pattern: /^\/tasks$/, view: renderTasks, nav: 'tasks', title: '待办与计划' },
   { pattern: /^\/plan\/([^/]+)$/, view: renderPlanDetail, nav: 'tasks', title: '计划' },
   { pattern: /^\/focus$/, view: renderFocus, nav: 'focus', title: '专注' },
+  { pattern: /^\/projects$/, view: renderProjects, nav: 'projects', title: '学习项目' },
+  { pattern: /^\/projects\/([^/]+)$/, view: renderProjectDetail, nav: 'projects', title: '学习项目' },
   { pattern: /^\/textbooks$/, view: renderTextbooks, nav: 'textbooks', title: '教材精读' },
   { pattern: /^\/textbook\/([^/]+)$/, view: renderTextbook, nav: 'textbooks', title: '教材精读' },
+  { pattern: /^\/articles$/, view: renderArticles, nav: 'articles', title: '外刊阅读' },
+  { pattern: /^\/article\/([^/]+)$/, view: renderArticle, nav: 'articles', title: '外刊阅读' },
   { pattern: /^\/chat$/, view: renderChatList, nav: 'chat', title: 'AI 整理空间' },
   { pattern: /^\/chat\/([^/]+)$/, view: renderChat, nav: 'chat', title: 'AI 整理空间' },
-  { pattern: /^\/archive$/, view: renderArchive, nav: 'archive', title: '我的档案' },
-  { pattern: /^\/archive\/([^/]+)$/, view: renderArchiveDetail, nav: 'archive', title: '档案' },
-  { pattern: /^\/tools$/, view: renderTools, nav: 'tools', title: '我的工具' },
   { pattern: /^\/settings$/, view: renderSettings, nav: '', title: '设置' },
 ];
 
@@ -99,6 +101,10 @@ const app = {
   async render(path, args, { keepScroll = false } = {}) {
     const found = matchRoute(path);
     const viewRoot = this.viewRoot;
+
+    // 打开一本书就进入沉浸阅读：隐藏全局侧栏，整屏留给这本书
+    document.body.classList.toggle('reading-book', Boolean(found && found.route.view === renderTextbook));
+    document.body.classList.toggle('reading-article', Boolean(found && found.route.view === renderArticle));
 
     if (!found) {
       viewRoot.replaceChildren(
@@ -182,16 +188,21 @@ const app = {
         badge: stats.focusToday || null, quiet: !stats.focusToday,
       },
       {
+        id: 'chat', label: 'AI 整理空间', icon: '◔', to: '/chat',
+        badge: pendingProposals || null,
+      },
+      { group: '学习工具' },
+      {
+        id: 'projects', label: '学习项目', icon: '▣', to: '/projects',
+        badge: stats.projects || null, quiet: !stats.projects,
+      },
+      {
         id: 'textbooks', label: '教材精读', icon: '▤', to: '/textbooks',
         badge: stats.textbooks || null, quiet: true,
       },
       {
-        id: 'chat', label: 'AI 整理空间', icon: '◔', to: '/chat',
-        badge: pendingProposals || null,
+        id: 'articles', label: '外刊阅读', icon: '▥', to: '/articles',
       },
-      { group: '我的' },
-      { id: 'archive', label: '我的档案', icon: '▢', to: '/archive', badge: stats.archives || null, quiet: true },
-      { id: 'tools', label: '我的工具', icon: '⚒', to: '/tools' },
     ];
 
     const nav = h('div.nav');
@@ -200,8 +211,10 @@ const app = {
         nav.appendChild(h('div.nav-group-title', {}, it.group));
         continue;
       }
+      const active = this.current && this.current.nav === it.id;
       nav.appendChild(
-        h(`button.nav-item${this.current && this.current.nav === it.id ? '.active' : ''}`, {
+        h(`button.nav-item${active ? '.active' : ''}`, {
+          title: it.label,
           onclick: () => this.navigate(it.to),
         }, [
           h('span.nav-icon', {}, it.icon),

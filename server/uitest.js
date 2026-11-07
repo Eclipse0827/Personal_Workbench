@@ -14,6 +14,7 @@
  */
 
 const path = require('path');
+const fs = require('fs/promises');
 const { pathToFileURL } = require('url');
 const db = require('./db');
 
@@ -71,7 +72,12 @@ class El {
     return {
       add: (...n) => { const s = new Set(parts()); n.forEach((x) => s.add(x)); self._class = [...s].join(' '); },
       remove: (...n) => { const s = new Set(parts()); n.forEach((x) => s.delete(x)); self._class = [...s].join(' '); },
-      toggle: (n) => { const s = new Set(parts()); if (s.has(n)) s.delete(n); else s.add(n); self._class = [...s].join(' '); },
+      toggle: (n, force) => {
+        const s = new Set(parts());
+        const on = force === undefined ? !s.has(n) : Boolean(force);
+        if (on) s.add(n); else s.delete(n);
+        self._class = [...s].join(' ');
+      },
       contains: (n) => parts().includes(n),
     };
   }
@@ -226,11 +232,13 @@ async function main() {
 
   // 记录起始状态，结束后只清理自己建的
   const before = await api.bootstrap();
+  const aliasesBefore = await fs.readFile(db.FOCUS_ALIASES_FILE, 'utf8').catch(() => null);
   const beforeIds = {
     tasks: new Set(before.tasks.map((t) => t.id)),
     plans: new Set(before.plans.map((p) => p.id)),
     archives: new Set(before.archives.map((a) => a.id)),
     conversations: new Set(before.conversations.map((c) => c.id)),
+    projects: new Set(before.projects.map((p) => p.id)),
   };
 
   // ---------------------------------------------------------------- 造数据
@@ -251,13 +259,6 @@ async function main() {
 
   const pourConv = await api.createConversation({});
   await api.sendMessage(pourConv.id, '我就是很难受，什么都不想做，不想听道理。');
-
-  const archive = await api.createArchive({
-    title: '一次自己保存的摘要',
-    content: '这是我自己写的档案内容。\n\n## 小标题\n\n- 一条\n- 另一条',
-    type: 'summary',
-    sourceConversationId: conv.id,
-  });
 
   const focusNow = new Date();
   const yesterdayEnd = new Date(focusNow);
@@ -311,8 +312,72 @@ async function main() {
   const testBook = await api.getTextbook(analyzedBook.book.id);
   const testSection = testBook.chapters[0].sections[0];
 
+  const testProject = await api.createProject({
+    title: 'UI 自测 · 自动控制原理',
+    description: '把课程进度放到一个项目里看',
+  });
+  const seqCourse = await api.addCourse(testProject.id, {
+    title: '自动控制原理 · 慕课',
+    platform: 'bilibili',
+    source: '2024 版',
+    url: 'https://www.bilibili.com/video/BV1uitest?p=1',
+    totalEpisodes: 10,
+    completedEpisodes: 3,
+    lastEpisode: 4,
+  });
+  const unknownCourse = await api.addCourse(testProject.id, {
+    title: '现代控制理论 · 集数待定',
+    platform: 'mooc',
+    source: '讲义在网盘',
+    completedEpisodes: 2,
+    lastEpisode: 2,
+  });
+  const doneCourse = await api.addCourse(testProject.id, {
+    title: '绪论 · 已经学完',
+    platform: 'other',
+    totalEpisodes: 3,
+    completedEpisodes: 3,
+    lastEpisode: 3,
+  });
+
+  const uiArticleText = [
+    '# A Slow Morning',
+    '',
+    'Attention is a finite resource, and the morning decides how it will be spent.',
+    '',
+    '## Start before the noise',
+    '',
+    'A slow beginning is not a wasted one. It gives the day a shape.',
+    '',
+    'Write the first sentence before opening anything else.',
+    '',
+    'The rest of the morning can then follow that sentence.',
+  ].join('\n');
+  const testArticle = await api.createArticle({
+    title: 'UI 自测 · 外刊阅读',
+    text: uiArticleText,
+    format: 'md',
+    source: 'UI 自测刊物',
+  });
+  const testArticleDetail = await api.getArticle(testArticle.id);
+  await api.addHighlight(testArticle.id, {
+    paragraphId: testArticleDetail.paragraphs[1].id,
+    start: 0,
+    end: 9,
+    note: '第一处批注',
+  });
+  const testVocabTerm = `uivocab${Date.now()}`;
+  const testVocab = await api.addVocabulary({
+    articleId: testArticle.id,
+    term: testVocabTerm,
+    kind: 'word',
+    selectionText: 'attention',
+    contextText: 'Attention is a finite resource.',
+    entry: { definitionZh: '注意力', provider: 'mock' },
+  });
+
   await stateMod.refresh();
-  ok('测试数据已就绪', Boolean(taskToday.id && plan.id && prop && archive.id));
+  ok('测试数据已就绪', Boolean(taskToday.id && plan.id && prop));
   ok('AI 给出了行动方案', Boolean(prop));
   ok('测试教材已整理成章 → 节',
     testBook.status === 'ready' && Boolean(testSection && testSection.id));
@@ -332,14 +397,19 @@ async function main() {
     ok('B 显示今日已完成情况', t.includes('今日已完成'));
     ok('B 有快速新增任务入口', t.includes('新增任务'));
     ok('B 有「全部未完成」入口', t.includes('全部未完成'));
-    ok('C 有自然语言输入框', t.includes('现在在想什么'));
-    ok('C 有四个快捷入口', ['我想理清一件事', '我最近有些焦虑', '帮我规划接下来的学习', '帮我拆成小任务']
-      .every((x) => t.includes(x)));
-    ok('C AI 入口如实标注当前引擎',
-      t.includes('本地规则引擎') || t.includes('Ollama') || t.includes('远程模型'));
+    ok('C 有「和 AI 聊会」直达入口', t.includes('和 AI 聊会'));
+    ok('C 入口是一个按钮而不是大段说明', Boolean(root.querySelector('.ai-portal'))
+      && !t.includes('遇到问题了'));
+    const staleStarts = ['我想理清一件事', '我最近有些焦虑', '帮我规划接下来的学习', '帮我拆成小任务']
+      .filter((x) => root.querySelectorAll('button').some((b) => b.allText().includes(x)));
+    ok('C 不再保留原来的大输入框与快捷问题',
+      !root.querySelector('textarea') && staleStarts.length === 0, staleStarts.join(','));
+    const portal = root.querySelector('.ai-portal');
+    if (portal) portal.fire('click');
+    ok('C 点一下就进入 AI 整理页', navigated.includes('/chat'));
     ok('D 显示最近计划', t.includes('考研初试'));
-    ok('E 工具入口存在', t.includes('思考档案') && t.includes('教材精读'));
-    ok('E 未实现的工具标「规划中」', t.includes('规划中'));
+    ok('工具不再重复堆在概览里', !t.includes('我的工具') && !root.querySelector('.tool-grid'));
+    ok('概览不再出现档案入口', !t.includes('我的档案') && !t.includes('思考档案'));
     ok('没有 [object Object]', !t.includes('[object Object]'));
   }
 
@@ -356,7 +426,10 @@ async function main() {
     ok('未完成视图包含今天与无日期任务', t.includes('今天要写的作业') && t.includes('还没定哪天做的任务'));
     ok('★ 无日期任务单独成组，不会消失', t.includes('未安排日期'));
     ok('可以看到任务来源标记（AI 建议 / 手动）', true);
-    ok('有新增任务与新建计划按钮', t.includes('新增任务') && t.includes('新建计划'));
+    ok('顶部有一行快速新建待办', t.includes('新建待办') && t.includes('添加')
+      && Boolean(root.querySelector('.quick-add')));
+    ok('进行中列表可以折叠', Boolean(root.querySelector('.todo-group-head')));
+    ok('有新建计划入口', t.includes('新建计划'));
     ok('没有 [object Object]', !t.includes('[object Object]'));
 
     const dateView = (await renderView('tasks', { tab: 'date' }, all)).root.allText();
@@ -413,6 +486,29 @@ async function main() {
     ok('★ 点昨天的柱子能看到昨天的内容分布',
       Boolean(legend) && legend.allText().includes('UI 自测 · 背单词'));
 
+    const firstSeg = root.querySelector('.focus-pie-seg');
+    ok('★ 饼图色块可以悬停', Boolean(firstSeg));
+    if (firstSeg) {
+      const segKey = firstSeg.getAttribute('data-key');
+      firstSeg.fire('mouseenter');
+      const hoverRows = root.querySelectorAll('.focus-legend-row')
+        .filter((row) => row.classList.contains('is-hovered'));
+      const hoverName = root.querySelector('.focus-pie-hover-name');
+      const hoverMeta = root.querySelector('.focus-pie-hover-meta');
+      ok('★ 悬停时对应色块放大、其余变淡',
+        firstSeg.classList.contains('is-hovered')
+          && root.querySelector('.focus-pie-svg').classList.contains('has-hover'));
+      ok('★ 悬停时图例跟着高亮',
+        hoverRows.length === 1 && hoverRows[0].getAttribute('data-key') === segKey);
+      ok('★ 悬停时圆心显示对应的专注模块',
+        Boolean(hoverName) && hoverName.textContent.toLowerCase() === segKey
+          && Boolean(hoverMeta) && /分钟|小时/.test(hoverMeta.textContent));
+      firstSeg.fire('mouseleave');
+      ok('★ 移开后恢复圆心总计',
+        !root.querySelector('.focus-pie-wrap').classList.contains('is-hovering')
+          && !root.querySelector('.focus-pie-hover-name').textContent);
+    }
+
     const rows = root.querySelectorAll('.focus-content-row');
     const vocabRow = rows.find((row) => row.allText().includes('UI 自测 · 背单词'));
     ok('★ 可以选中一项内容查看累计', Boolean(vocabRow));
@@ -422,6 +518,57 @@ async function main() {
       Boolean(picked) && picked.allText().includes('全部累计') && picked.allText().includes('15 分钟'));
     ok('★ 选中内容后，记录列表跟着筛选',
       root.querySelector('.focus-history').allText().includes('「UI 自测 · 背单词」的记录'));
+
+    const mergeBox = root.querySelector('.focus-merge');
+    ok('★ 选中内容后可以把这一项归到某个待办',
+      Boolean(mergeBox) && mergeBox.allText().includes('把这一项归到'));
+    const mergeSelect = root.querySelector('.focus-merge-select');
+    const mergeValues = mergeSelect
+      ? mergeSelect.querySelectorAll('option').map((o) => o.getAttribute('value'))
+      : [];
+    ok('★ 归类目标同时包含待办与其他专注内容',
+      mergeValues.includes('今天要写的作业') && mergeValues.includes('UI 自测 · 数学练习'),
+      mergeValues.join(' / '));
+    ok('★ 归类说明写明不会删原始记录',
+      Boolean(mergeBox) && mergeBox.allText().includes('原始专注记录不会被删'));
+  }
+
+  {
+    // 归类走真实的接口与渲染：合并之后，汇总只剩目标一项，历史记录仍保留原写法
+    const aliasNow = new Date();
+    const aliasSession = await api.createFocusSession({
+      clientToken: `uitest-focus-alias-${Date.now()}`,
+      mode: 'focus',
+      title: 'UI 自测 · 归类写法',
+      minutes: 5,
+      actualSeconds: 300,
+      startedAt: new Date(aliasNow.getTime() - 5 * 60 * 1000).toISOString(),
+      endedAt: aliasNow.toISOString(),
+    });
+    uiFocusIds.push(aliasSession.session.id);
+    const mergedUi = await api.mergeFocusContent({
+      from: 'UI 自测 · 归类写法', to: 'UI 自测 · 背单词',
+    });
+    ok('接口可以把一种写法归到已有内容',
+      mergedUi.alias && mergedUi.alias.from === 'UI 自测 · 归类写法' && mergedUi.alias.to === 'UI 自测 · 背单词');
+
+    const { root, error } = await renderView('focus', {}, all);
+    ok('归类后专注页渲染无异常', !error, error && error.message);
+    const rows = root.querySelectorAll('.focus-content-row');
+    ok('★ 归类后时长汇总里只剩目标一项',
+      !rows.some((row) => row.allText().includes('UI 自测 · 归类写法'))
+      && rows.some((row) => row.allText().includes('UI 自测 · 背单词')));
+    const targetRow = rows.find((row) => row.allText().includes('UI 自测 · 背单词'));
+    if (targetRow) targetRow.fire('click');
+    const picked = root.querySelector('.focus-content-pick');
+    ok('★ 选中后能看到已并入的写法',
+      Boolean(picked) && picked.allText().includes('已并入') && picked.allText().includes('UI 自测 · 归类写法'));
+    ok('★ 历史记录跟着归类合并，并标出原写法',
+      root.querySelector('.focus-history').allText().includes('原「UI 自测 · 归类写法」'));
+
+    const unmergedUi = await api.unmergeFocusContent({ from: 'UI 自测 · 归类写法' });
+    ok('取消归类后接口恢复单独一项',
+      !unmergedUi.aliases.some((a) => a.from === 'UI 自测 · 归类写法'));
   }
 
   // ---------------------------------------------------------------- 教材书架
@@ -432,6 +579,13 @@ async function main() {
     const t = root.allText();
     ok('有导入 PDF 的入口', t.includes('导入 PDF 教材'));
     ok('列出已导入的测试教材', t.includes('测试教材'));
+    ok('教材用目录表整行排版，而不是卡片网格', root.querySelectorAll('.catalog-row').length >= 1
+      && !root.querySelector('.textbook-grid'));
+    ok('目录有深色表头与书名 / 结构 / 状态列', Boolean(root.querySelector('.catalog-head-row'))
+      && ['编号', '教材', '结构', '状态'].every((x) => t.includes(x)));
+    ok('页头显示教材与章节统计', t.includes('教材目录') && t.includes('本教材') && t.includes('个章节'));
+    const notes = root.querySelector('.catalog-notes');
+    ok('导入说明收进可展开的折叠块', Boolean(notes) && notes.tagName === 'DETAILS');
     ok('显示章 / 节数量', t.includes('2 章') || t.includes('章'));
     ok('如实说明扫描版会用本机 OCR', t.includes('扫描版') && t.includes('OCR'));
     ok('说明远程模型会收到教材内容', t.includes('远程模型') && t.includes('教材原文'));
@@ -446,9 +600,11 @@ async function main() {
     const t = root.allText();
     ok('显示书名与全书脉络', t.includes('测试教材') && t.includes('全书脉络'));
     ok('思维导图按章展开并可回到小节', t.includes('第1章 直流电路') && t.includes('欧姆定律') && /\d+–\d+/.test(t));
-    ok('有全书导览与阅读顺序', t.includes('全书导览') && t.includes('建议的阅读顺序'));
+    ok('★ 不再显示多余的全书导览卡片',
+      !root.querySelector('.reader-guide') && !t.includes('建议的阅读顺序'));
     ok('列出小节与页码', t.includes('欧姆定律') && /\d+–\d+/.test(t));
-    ok('标出有动画的小节', t.includes('动画'));
+    ok('思维导图里仍标出有动画的小节',
+      root.querySelectorAll('.mindmap-section-demo').length >= 1);
     ok('★ 全书有术语卡，用生活例子解释',
       t.includes('值得先弄懂的词') && t.includes('生活里') && t.includes('欧姆定律'));
     ok('有开始阅读入口', t.includes('从第一节开始') || t.includes('继续上次阅读'));
@@ -468,6 +624,13 @@ async function main() {
     await new Promise((r) => setTimeout(r, 200));
     const t = root.allText();
     ok('显示章节与小节标题', t.includes('第1章') && t.includes('欧姆定律'));
+    ok('★ 每章开始前有本章知识地图', Boolean(root.querySelector('.chapter-map-card'))
+      && t.includes('本章知识地图') && root.querySelectorAll('.chapter-map-node').length >= 1);
+    ok('★ 知识地图的主线不再拼接出「。；」', !t.includes('。；'));
+    ok('★ 讲义先交代在整章里的位置', t.includes('在整章里的位置'));
+    ok('★ 讲义用编号步骤顺着讲', Boolean(root.querySelector('.reader-thread'))
+      && root.querySelectorAll('.reader-thread-step').length >= 1
+      && t.includes('顺着这条线读'));
     ok('有讲义 / 原文 / PDF 三个标签中的前两个', t.includes('讲义') && t.includes('教材原文'));
     ok('有标记已读入口', t.includes('标记为已读'));
     ok('载入本节的动画演示', t.includes('串联与并联：电流到底怎么走'));
@@ -515,10 +678,17 @@ async function main() {
     ok('代码块里的编号不会被拆分',
       Boolean(fenced.querySelector('pre')) && fenced.allText().includes('1、代码里的编号 2、原样保留'));
 
-    const { splitQuestionLines } = await import(pathToFileURL(path.join(PUBLIC, 'js', 'views', 'textbook.js')).href);
+    const { splitQuestionLines, studySearchQuery } = await import(pathToFileURL(path.join(PUBLIC, 'js', 'views', 'textbook.js')).href);
     const parts = splitQuestionLines('1、先算总电阻；2、再求干路电流；3、最后验算。');
     ok('★ 题目里挤在一行的分点会拆成多行', parts.length === 3, `实际 ${parts.length}`);
     ok('单个问题不会被拆碎', splitQuestionLines('为什么串联电路电流处处相等？').length === 1);
+
+    const search = studySearchQuery('计算机网络的传播过程是怎样的？', '什么是计算机网络');
+    ok('★ 站内搜索词去掉疑问词，也不重复本节标题',
+      search === '计算机网络 传播过程', search);
+    const shortSearch = studySearchQuery('它有什么特点？', '什么是计算机网络');
+    ok('问题太短时补上本节语境',
+      shortSearch.includes('什么是计算机网络') && shortSearch.includes('特点'), shortSearch);
 
     const rendered = renderMarkdown('## 读完自测\n\n1、串联电路有什么特点？2、并联电路有什么特点？');
     ok('Markdown 里的多条目问题会分别成行',
@@ -537,6 +707,121 @@ async function main() {
     ok('说明删计划不会删任务', t.includes('不会删掉它下面的任务'));
   }
 
+  // ---------------------------------------------------------------- 学习项目
+  console.log('\n【学习项目 · 列表】');
+  {
+    const { root, error, navigated } = await renderView('projects', {}, all);
+    ok('项目列表渲染无异常', !error, error && error.message);
+    const t = root.allText();
+    ok('显示项目名称与简介', t.includes('UI 自测 · 自动控制原理') && t.includes('把课程进度放到一个项目里看'));
+    ok('显示项目下的课程数', t.includes('学习项目 · 3 门课程'));
+    ok('显示项目整体进度', t.includes('46%') && t.includes('已完成 6 / 共 13 集'));
+    ok('标明未填总集数的课程不参与进度', t.includes('1 门未填总集数'));
+    ok('有新建项目入口', t.includes('＋ 新建项目'));
+    const cardActions = root.querySelector('.project-card-actions');
+    ok('项目卡上有编辑与删除', Boolean(cardActions) && cardActions.querySelectorAll('button').length === 2);
+    const card = root.querySelector('.project-card');
+    if (card) card.fire('click');
+    ok('点击项目卡进入详情', navigated.includes(`/projects/${testProject.id}`));
+    ok('没有 [object Object]', !t.includes('[object Object]'));
+  }
+
+  console.log('\n【学习项目 · 详情与课程进度】');
+  {
+    const { root, error } = await renderView('project-detail', { id: testProject.id }, all);
+    ok('项目详情渲染无异常', !error, error && error.message);
+    const t = root.allText();
+    ok('显示项目名称、简介与课程数', t.includes('UI 自测 · 自动控制原理')
+      && t.includes('把课程进度放到一个项目里看') && t.includes('3 门课程'));
+    ok('显示项目整体进度', t.includes('46%') && t.includes('已完成 6 / 共 13 集'));
+    ok('说明未填总集数的课程不参与项目进度', t.includes('1 门未填总集数，不参与进度计算'));
+    ok('有返回、编辑项目与添加课程入口',
+      t.includes('← 返回项目') && t.includes('编辑项目') && t.includes('＋ 添加课程'));
+
+    const cards = root.querySelectorAll('.course-card');
+    const seqCard = cards.find((c) => c.allText().includes('自动控制原理 · 慕课'));
+    const seqText = seqCard ? seqCard.allText() : '';
+    ok('课程卡显示平台、来源、已完成与最近学习',
+      seqText.includes('B 站') && seqText.includes('来源：2024 版')
+        && seqText.includes('已完成 3 集') && seqText.includes('第 4 集'));
+    ok('课程卡显示总集数与百分比进度', seqText.includes('10 集') && seqText.includes('30%'));
+    ok('课程卡有继续学习 / 完成本集 / 编辑 / 删除',
+      ['继续学习', '完成本集', '编辑', '删除'].every((x) => seqText.includes(x)));
+
+    const unknownCard = cards.find((c) => c.allText().includes('现代控制理论'));
+    const unknownText = unknownCard ? unknownCard.allText() : '';
+    ok('未填总集数的课程显示「未填写」和「不参与项目进度」',
+      unknownText.includes('未填写') && unknownText.includes('不参与项目进度'));
+    ok('未填总集数的课程显示进度暂不可计算', unknownText.includes('进度暂不可计算'));
+
+    const doneCard = cards.find((c) => c.allText().includes('绪论'));
+    const doneText = doneCard ? doneCard.allText() : '';
+    const doneButtons = doneCard ? doneCard.querySelectorAll('button') : [];
+    const completeBtn = doneButtons.find((b) => b.allText().includes('完成本集'));
+    ok('已学完的课程有标记，且完成本集按钮不可再点',
+      doneText.includes('已学完') && Boolean(completeBtn) && completeBtn.disabled);
+    ok('没有 [object Object]', !t.includes('[object Object]'));
+  }
+
+  console.log('\n【学习项目 · 继续学习与完成本集】');
+  {
+    const continued = await api.continueCourse(testProject.id, seqCourse.id);
+    ok('继续学习接口返回实际打开的目标集数', continued.targetEpisode === 4);
+    ok('B 站分 P 链接被定位到目标集数', String(continued.url).includes('p=4'), continued.url);
+    const afterContinue = await api.getProject(testProject.id);
+    const seqAfterContinue = afterContinue.courses.find((c) => c.id === seqCourse.id);
+    ok('继续学习会记录最近学习集数与学习时间',
+      seqAfterContinue.lastEpisode === 4 && Boolean(seqAfterContinue.lastStudiedAt));
+
+    await stateMod.refresh();
+    const detailAfterContinue = await renderView('project-detail', { id: testProject.id }, all);
+    const textAfterContinue = detailAfterContinue.root.allText();
+    ok('继续学习后详情显示实际打开的第 4 集', textAfterContinue.includes('第 4 集'));
+
+    const completed = await api.completeCourse(testProject.id, seqCourse.id);
+    ok('完成本集由接口推进已完成集数', completed.completedEpisodes === 4 && completed.nextEpisode === 5);
+
+    await stateMod.refresh();
+    const detailAfterComplete = await renderView('project-detail', { id: testProject.id }, all);
+    const textAfterComplete = detailAfterComplete.root.allText();
+    ok('完成本集后详情更新已完成集数与课程进度',
+      textAfterComplete.includes('已完成 4 集') && textAfterComplete.includes('40%'));
+
+    const listAfter = await renderView('projects', {}, all);
+    const listText = listAfter.root.allText();
+    ok('列表里的项目整体进度同步更新',
+      listText.includes('54%') && listText.includes('已完成 7 / 共 13 集'));
+    ok('列表显示最近学习时间', listText.includes('最近学习'));
+
+    const fsSync = require('fs');
+    const detailSrc = fsSync.readFileSync(path.join(PUBLIC, 'js', 'views', 'project-detail.js'), 'utf8');
+    ok('★ 继续学习与完成本集都调用后端接口，而不是前端改数',
+      detailSrc.includes('api.continueCourse') && detailSrc.includes('api.completeCourse')
+        && detailSrc.includes('result.targetEpisode') && detailSrc.includes('result.completedEpisodes'));
+    ok('★ 前端不自行推算目标集数',
+      !/completedEpisodes\s*\+\s*1/.test(detailSrc) && !/lastEpisode\s*\+\s*1/.test(detailSrc));
+  }
+
+  console.log('\n【学习项目 · 空状态】');
+  {
+    const emptyProject = await api.createProject({ title: 'UI 自测 · 空项目' });
+    await stateMod.refresh();
+    const { root, error } = await renderView('project-detail', { id: emptyProject.id }, all);
+    ok('空项目详情渲染无异常', !error, error && error.message);
+    const t = root.allText();
+    ok('空项目提示还没有课程', t.includes('这个项目还没有课程'));
+    ok('空项目有添加第一门课程的入口', t.includes('添加第一门课程'));
+    await api.deleteProject(emptyProject.id);
+    await stateMod.refresh();
+
+    const emptyList = await renderView('projects', {}, { ...all, projects: [] });
+    const emptyText = emptyList.root.allText();
+    ok('没有项目时显示空状态', emptyText.includes('还没有学习项目'));
+    ok('空状态给下一步入口', emptyText.includes('新建第一个项目'));
+  }
+
+  await stateMod.refresh();
+
   // ---------------------------------------------------------------- 对话列表
   console.log('\n【AI 整理空间 · 列表】');
   {
@@ -545,7 +830,8 @@ async function main() {
     const t = root.allText();
     ok('有开始新对话入口', t.includes('开始新的对话'));
     ok('列出已有对话', t.includes('考研'));
-    ok('明确说明当前用的是本地规则引擎', t.includes('本地规则引擎'));
+    ok('列表页不再放大段说明与引擎提示', !t.includes('不用先选情绪类型')
+      && !t.includes('当前用的是本地规则引擎'));
   }
 
   // ---------------------------------------------------------------- 对话详情
@@ -561,7 +847,7 @@ async function main() {
     ok('没有把规则引擎冒充成模型', !/Ollama 本地|远程模型/.test(t));
     ok('给出问题梳理卡', t.includes('问题梳理'));
     ok('梳理卡每一项可编辑（有输入控件）', root.querySelectorAll('div').length > 0);
-    ok('有保存为摘要入口', t.includes('保存为摘要'));
+    ok('对话页不再出现档案入口', !t.includes('保存为摘要') && !t.includes('我的档案'));
 
     ok('★ 显示行动方案卡', t.includes('待你确认'));
     ok('方案里列出了具体行动', t.includes('确定数学要用的教材和章节范围'));
@@ -589,50 +875,12 @@ async function main() {
     ok('倾诉时会话正常显示', t.includes('什么都不想做'));
   }
 
-  // ---------------------------------------------------------------- 档案
-  console.log('\n【我的档案（PRD 2.5 / 8.5）】');
+  // ---------------------------------------------------------------- 暂时隐藏的功能
+  console.log('\n【暂时隐藏：我的档案与独立工具页】');
   {
-    const { root, error } = await renderView('archive', {}, all);
-    ok('档案列表渲染无异常', !error, error && error.message);
-    const t = root.allText();
-    ok('列出自建档案', t.includes('一次自己保存的摘要'));
-    ok('★ 显示档案来源', t.includes('我手动保存'));
-    ok('显示保存时间', /年\d+月\d+日/.test(t));
-    ok('有新建档案入口', t.includes('新建档案'));
-    ok('有按类型筛选', t.includes('思考档案') && t.includes('重要摘要'));
-    ok('★ 迁移过来的记录出现在档案里', all.archives.some((a) => a.origin === 'legacy'));
-    ok('没有 [object Object]', !t.includes('[object Object]'));
-  }
-
-  {
-    const { root, error } = await renderView('archive-detail', { id: archive.id }, all);
-    ok('档案详情渲染无异常', !error, error && error.message);
-    const t = root.allText();
-    ok('显示档案标题与正文', t.includes('一次自己保存的摘要') && t.includes('这是我自己写的档案内容'));
-    ok('正文按结构渲染（标题 / 列表）', t.includes('小标题'));
-    ok('有编辑与删除入口', t.includes('编辑') && t.includes('删除'));
-  }
-
-  {
-    const { root } = await renderView('archive-detail', { id: archive.id, edit: '1' }, all);
-    const t = root.allText();
-    ok('编辑态可以改标题与内容', t.includes('保存') && t.includes('内容'));
-    ok('★ 编辑态说明不会改动来源',
-      t.includes('改这份摘要不会改动原始对话') || t.includes('原始文件不会被修改'));
-  }
-
-  // ---------------------------------------------------------------- 工具
-  console.log('\n【我的工具（PRD 2.6）】');
-  {
-    const { root, error } = await renderView('tools', {}, all);
-    ok('工具页渲染无异常', !error, error && error.message);
-    const t = root.allText();
-    ok('思考档案标为可用', t.includes('可用'));
-    ok('教材精读已接入真实页面', t.includes('教材精读') && t.includes('打开'));
-    ok('三个未实现工具都在', ['章节知识框架', '习题生成', '错题整理'].every((x) => t.includes(x)));
-    ok('★ 未实现工具明确标规划中', t.includes('规划中'));
-    ok('★ 明确写出规划中的工具点不进去', t.includes('不可点击进入') || t.includes('还在规划中'));
-    ok('有「现在可用」区', t.includes('现在可用'));
+    const appSrc = require('fs').readFileSync(path.join(PUBLIC, 'js', 'app.js'), 'utf8');
+    ok('侧栏与路由里不再出现我的档案', !appSrc.includes('我的档案') && !appSrc.includes('/archive'));
+    ok('独立工具页已移除，工具改为侧栏分组', !appSrc.includes('/tools') && appSrc.includes('学习工具'));
   }
 
   // ---------------------------------------------------------------- 设置
@@ -666,6 +914,12 @@ async function main() {
     ok('浮窗里能直接加待办',
       js.includes("request('POST', '/api/tasks'") && js.includes('float-new-task')
         && js.includes('submitNewTask'));
+    ok('浮窗里每条待办能自定义专注时长',
+      js.includes('float-task-min') && js.includes('minutesFor')
+        && js.includes('huan-float-task-minutes-v1') && js.includes('float-task-minutes'));
+    ok('浮窗有吸边开关和悬浮球倒计时',
+      js.includes('setSnap') && js.includes('renderBall')
+        && js.includes('formatBallClock') && js.includes('float-ball-clock'));
     ok('浮窗能开始、暂停、结束、放弃计时',
       js.includes('/api/focus/active') && js.includes("action: wasPaused ? 'resume' : 'pause'")
         && js.includes('finishEarly') && js.includes("'/api/focus/active/cancel'"));
@@ -673,15 +927,28 @@ async function main() {
 
     const css = fs.readFileSync(path.join(PUBLIC, 'css', 'float.css'), 'utf8');
     ok('浮窗是半透明纸片，顶部可拖动',
-      css.includes('-webkit-app-region: drag') && css.includes('rgba(248, 246, 240, .90)'));
+      css.includes('-webkit-app-region: drag') && /--bg-glass:\s*rgba\([^)]*\.9/.test(css));
     ok('浮窗的加待办输入框不拦截拖动',
       css.includes('.float-add-input') && css.includes('-webkit-app-region: no-drag'));
+    ok('悬浮球是一颗带进度环的小圆',
+      css.includes('.float-ball') && css.includes('conic-gradient')
+        && css.includes('.float-root.ball-mode'));
 
     const main = fs.readFileSync(path.join(PUBLIC, '..', 'desktop', 'float-main.js'), 'utf8');
     ok('桌面外壳透明、无边框、置顶',
       /transparent:\s*true/.test(main) && /frame:\s*false/.test(main) && /alwaysOnTop:\s*true/.test(main));
     ok('桌面外壳隔离 Node 能力',
       /contextIsolation:\s*true/.test(main) && /nodeIntegration:\s*false/.test(main));
+    ok('桌面外壳能把窗口收成吸边小球并拖回展开',
+      main.includes('BALL_SIZE') && main.includes('snapPosition')
+        && main.includes('float:set-snap') && main.includes('float:drag-move')
+        && main.includes('float:expand') && main.includes('broadcastState'));
+
+    const preload = fs.readFileSync(path.join(PUBLIC, '..', 'desktop', 'preload.js'), 'utf8');
+    ok('页面拿得到吸边、展开与拖动窗口的能力',
+      preload.includes('float:set-snap') && preload.includes('float:expand')
+        && preload.includes('float:drag-start') && preload.includes('float:drag-end')
+        && preload.includes('float:state'));
 
     const pkg = JSON.parse(fs.readFileSync(path.join(PUBLIC, '..', 'package.json'), 'utf8'));
     ok('npm run float 有对应启动脚本', Boolean(pkg.scripts && pkg.scripts.float));
@@ -690,6 +957,54 @@ async function main() {
     ok('专注页有「浮到桌面」入口', focusText.includes('浮到桌面'));
     const tasksText = (await renderView('tasks', { tab: 'open' }, all)).root.allText();
     ok('待办页也有「浮到桌面」入口', tasksText.includes('浮到桌面'));
+  }
+
+  // ---------------------------------------------------------------- 外刊阅读
+  console.log('\n【外刊阅读 · 书架与生词本】');
+  {
+    const { root, error, navigated } = await renderView('articles', {}, all);
+    ok('外刊书架渲染无异常', !error, error && error.message);
+    const t = root.allText();
+    ok('显示外刊书架标题与说明', t.includes('外刊书架') && t.includes('不做 OCR'));
+    ok('显示粘贴与导入入口', t.includes('粘贴文本') && t.includes('导入文件'));
+    ok('列出测试文章', t.includes('UI 自测 · 外刊阅读'));
+    ok('说明正文与批注保存在本机', t.includes('data/articles/'));
+    ok('★ 说明文章不会自动进入长期记忆', t.includes('不会自动写进') && t.includes('长期记忆'));
+    ok('文章行有阅读入口', root.querySelectorAll('.article-row').length >= 1);
+    const firstRow = root.querySelector('.article-row');
+    if (firstRow) firstRow.fire('click');
+    ok('文章行能跳到阅读器', navigated.includes(`/article/${testArticle.id}`));
+    ok('没有 [object Object]', !t.includes('[object Object]'));
+  }
+
+  console.log('\n【外刊阅读 · 生词本】');
+  {
+    const { root, error } = await renderView('articles', { tab: 'vocabulary' }, all);
+    ok('生词本渲染无异常', !error, error && error.message);
+    const t = root.allText();
+    ok('显示测试生词与释义', t.includes(testVocabTerm) && t.includes('注意力'));
+    ok('生词标明来源文章', t.includes('UI 自测 · 外刊阅读'));
+    ok('有备注与删除入口', t.includes('写备注') && root.querySelectorAll('.vocab-card').length >= 1);
+    ok('没有 [object Object]', !t.includes('[object Object]'));
+  }
+
+  console.log('\n【外刊阅读 · 阅读器】');
+  {
+    const { root, error, cleanup } = await renderView('article', { id: testArticle.id }, all);
+    ok('阅读器渲染无异常', !error, error && error.message);
+    const t = root.allText();
+    ok('显示文章标题与来源', t.includes('UI 自测 · 外刊阅读') && t.includes('UI 自测刊物'));
+    ok('正文按段落渲染', root.querySelectorAll('.article-block').length >= 6);
+    ok('显示词汇 / 批注 / 文章问答三个面板', t.includes('词汇') && t.includes('批注 1') && t.includes('文章问答'));
+    ok('★ 已有高亮用 mark 渲染', root.querySelectorAll('.article-hl').length >= 1);
+    ok('有字号调节与阅读进度', root.querySelectorAll('.article-font').length === 1 && t.includes('A+'));
+    ok('默认面板提示点词或选句', t.includes('点一个词') && t.includes('双击句子'));
+    ok('★ 明确标注是本地规则引擎，不伪造释义',
+      t.includes('本地规则引擎') && t.includes('没有释义能力'));
+    ok('★ 说明当前文章只作为本次阅读上下文', t.includes('不会写进长期 AI 记忆'));
+    ok('没有 [object Object]', !t.includes('[object Object]'));
+    ok('阅读器返回清理函数', typeof cleanup === 'function');
+    if (cleanup) cleanup();
   }
 
   // ---------------------------------------------------------------- 路由
@@ -704,9 +1019,10 @@ async function main() {
       ['/', 'renderDashboard'], ['/tasks', 'renderTasks'], ['/plan/abc123', 'renderPlanDetail'],
       ['/focus', 'renderFocus'], ['/textbooks', 'renderTextbooks'],
       ['/textbook/abc123', 'renderTextbook'],
+      ['/articles', 'renderArticles'], ['/article/abc123', 'renderArticle'],
+      ['/projects', 'renderProjects'], ['/projects/abc123', 'renderProjectDetail'],
       ['/chat', 'renderChatList'], ['/chat/abc123', 'renderChat'],
-      ['/archive', 'renderArchive'], ['/archive/abc123', 'renderArchiveDetail'],
-      ['/tools', 'renderTools'], ['/settings', 'renderSettings'],
+      ['/settings', 'renderSettings'],
     ];
     const bad = [];
     for (const [p, want] of cases) {
@@ -715,11 +1031,31 @@ async function main() {
     }
     ok('所有路径都能匹配到正确视图', bad.length === 0, bad.join('; '));
 
-    ok('一级导航含概览 / 待办与计划 / 专注 / 教材 / AI 整理空间 / 档案 / 工具',
-      ['概览', '待办与计划', '专注番茄钟', '教材精读', 'AI 整理空间', '我的档案', '我的工具']
-        .every((x) => appSrc.includes(x)));
+    ok('一级导航含概览 / 待办与计划 / 专注 / AI 整理空间',
+      ['概览', '待办与计划', '专注番茄钟', 'AI 整理空间'].every((x) => appSrc.includes(x)));
+    ok('侧栏学习工具分组包含学习项目与教材精读',
+      appSrc.includes('学习工具') && appSrc.includes('学习项目') && appSrc.includes('教材精读'));
+    ok('侧栏有外刊阅读入口', appSrc.includes('外刊阅读') && appSrc.includes("to: '/articles'"));
+    ok('不再展示章节知识框架 / 习题生成 / 错题整理',
+      ['章节知识框架', '习题生成', '错题整理'].every((x) => !appSrc.includes(x)));
+    ok('侧栏没有点不动的规划中工具', !appSrc.includes('还在规划中'));
     ok('设置不在侧栏主导航里（放在底部）', appSrc.includes('设置与数据'));
     ok('导航有当前页选中状态', appSrc.includes('.active') || appSrc.includes("'.active'"));
+    const shellCss = require('fs').readFileSync(path.join(PUBLIC, 'css', 'style.css'), 'utf8');
+    ok('★ 打开教材后隐藏全局侧栏，整屏留给阅读',
+      appSrc.includes("classList.toggle('reading-book'")
+      && /body\.reading-book[^{]*\.sidebar/.test(shellCss)
+      && /body\.reading-book[^{]*\.topbar/.test(shellCss));
+
+    const articleViewSrc = require('fs').readFileSync(path.join(PUBLIC, 'js', 'views', 'article.js'), 'utf8');
+    const articleTextViewSrc = require('fs').readFileSync(path.join(PUBLIC, 'js', 'article-text.js'), 'utf8');
+    const indexHtml = require('fs').readFileSync(path.join(PUBLIC, 'index.html'), 'utf8');
+    ok('★ 外刊阅读器整屏阅读，隐藏全局侧栏', appSrc.includes("classList.toggle('reading-article'"));
+    ok('页面加载外刊样式', indexHtml.includes('/css/reading.css'));
+    ok('★ 文章正文用文本节点与 mark 渲染，不拼 innerHTML',
+      !/\.innerHTML\s*=/.test(articleViewSrc) && !/\.innerHTML\s*=/.test(articleTextViewSrc)
+      && articleTextViewSrc.includes('createTextNode') && articleTextViewSrc.includes('article-hl'));
+    ok('阅读器通过段落组件渲染正文', articleViewSrc.includes('renderArticleParagraph'));
   }
 
   // ---------------------------------------------------------------- 清理
@@ -730,15 +1066,25 @@ async function main() {
   for (const p of after.plans) if (!beforeIds.plans.has(p.id)) { await api.deletePlan(p.id); removed += 1; }
   for (const a of after.archives) if (!beforeIds.archives.has(a.id)) { await api.deleteArchive(a.id); removed += 1; }
   for (const c of after.conversations) if (!beforeIds.conversations.has(c.id)) { await api.deleteConversation(c.id); removed += 1; }
+  for (const p of after.projects) if (!beforeIds.projects.has(p.id)) { await api.deleteProject(p.id); removed += 1; }
   for (const id of uiFocusIds) { await db.remove('focusSessions', id); removed += 1; }
+  if (aliasesBefore !== null) await db.atomicWrite(db.FOCUS_ALIASES_FILE, aliasesBefore);
+  else await fs.rm(db.FOCUS_ALIASES_FILE, { force: true });
   await api.deleteTextbook(testBook.id);
-  removed += 1;
+  await api.deleteArticle(testArticle.id);
+  await api.deleteVocabulary(testVocab.entry.id);
+  removed += 3;
   ok(`清理了 ${removed} 项测试数据`, removed > 0);
 
   const final = await api.bootstrap();
   ok('★ 用户原有档案没有被动过',
     final.archives.filter((a) => a.origin === 'legacy').length
     === before.archives.filter((a) => a.origin === 'legacy').length);
+  ok('★ 学习项目的测试数据已清理干净',
+    !final.projects.some((p) => String(p.title).startsWith('UI 自测')));
+  const [articlesLeft, vocabLeft] = await Promise.all([api.listArticles(), api.listVocabulary()]);
+  ok('★ 外刊测试文章已清理', !articlesLeft.some((a) => a.id === testArticle.id));
+  ok('★ 测试生词已清理', !vocabLeft.some((v) => v.id === testVocab.entry.id));
 
   console.log(`\n${'─'.repeat(56)}`);
   console.log(`  通过 ${pass} 项，失败 ${fail} 项`);

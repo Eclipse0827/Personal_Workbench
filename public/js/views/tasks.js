@@ -3,18 +3,14 @@
  * ---------------------------------------------------------------
  * PRD 2.3：这是完整的任务管理中心，**不依赖 AI 也能用**。
  *
- * 覆盖：手动创建 / 编辑 / 删除（带确认）/ 标记完成 / 恢复未完成 /
- * 按日期和状态查看 / 全部未完成 / 创建编辑归档计划 / 任务关联计划 /
- * 查看某计划下全部任务 / 区分手动创建与 AI 建议生成。
- *
- * 一个容易做错的细节（PRD 3.3 / 8.2）：**没有日期的未完成任务不能消失**。
- * 所以「未完成」和「按日期」两个视图都会单独保留一个「未安排日期」分组。
+ * 版式按参考图收敛：顶部一行「新建待办」，下面一个可折叠的「进行中」列表。
+ * 没有日期的未完成任务仍然留在列表里，用一条细分隔标出，不会消失。
  */
 
 import { api } from '../api.js';
 import {
   h, toast, toastError, confirmDialog, taskRow, emptyState, pageHead,
-  fmtDay, fmtShort, truncate, today, TASK_STATUS_LABEL, PLAN_STATUS_LABEL,
+  fmtDay, truncate, PLAN_STATUS_LABEL,
 } from '../ui.js';
 import { state, allOpen, todayOpen, planById } from '../state.js';
 import { openTaskForm, openPlanForm } from './task-form.js';
@@ -27,6 +23,8 @@ const TABS = [
   { id: 'date', label: '按日期' },
   { id: 'plans', label: '计划' },
 ];
+
+let openCollapsed = false;
 
 export default async function renderTasks(root, ctx) {
   const tab = TABS.some((t) => t.id === ctx.args.tab) ? ctx.args.tab : 'open';
@@ -73,7 +71,76 @@ export default async function renderTasks(root, ctx) {
     });
   }
 
+  // ---------------------------------------------------------------- 快速新建
+
+  const quickInput = h('input', {
+    type: 'text',
+    placeholder: '输入新待办，回车添加…',
+    maxlength: '200',
+    onkeydown: (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); quickCreate(); }
+    },
+  });
+  const quickPriority = h('select', { 'aria-label': '优先级' }, [
+    h('option', { value: 'normal' }, '普通'),
+    h('option', { value: 'important' }, '重要'),
+  ]);
+  const quickBtn = h('button.btn', {
+    type: 'button',
+    onclick: () => quickCreate(),
+  }, '添加');
+
+  let adding = false;
+  async function quickCreate() {
+    const title = quickInput.value.trim();
+    if (!title) {
+      toast('先写一句要做的事。', 'warn');
+      quickInput.focus();
+      return;
+    }
+    if (adding) return;
+    adding = true;
+    quickBtn.disabled = true;
+    try {
+      await api.createTask({ title, priority: quickPriority.value });
+      quickInput.value = '';
+      await ctx.rerender();
+      toast('已加入待办。');
+    } catch (err) {
+      toastError(err);
+      adding = false;
+      quickBtn.disabled = false;
+    }
+  }
+
+  function quickAddCard() {
+    return h('div.card.quick-add', {}, [
+      h('div.quick-add-label', {}, '新建待办'),
+      h('div.quick-add-row', {}, [quickInput, quickPriority, quickBtn]),
+    ]);
+  }
+
   // ---------------------------------------------------------------- 各视图
+
+  function groupHead(title, count) {
+    return h('button.todo-group-head', {}, [
+      h('span.todo-group-title', {}, title),
+      h('span.todo-group-count', {}, String(count)),
+      h('span.todo-group-toggle', {}, '▾'),
+    ]);
+  }
+
+  function openGroup(title, tasks) {
+    const group = h(`div.todo-group${openCollapsed ? '.collapsed' : ''}`, {});
+    const head = groupHead(title, tasks.length);
+    head.addEventListener('click', () => {
+      openCollapsed = !openCollapsed;
+      group.classList.toggle('collapsed', openCollapsed);
+    });
+    group.appendChild(head);
+    group.appendChild(h('div.card.todo-list-card', {}, [h('div.task-list', {}, tasks.map(rowFor))]));
+    return group;
+  }
 
   function openView() {
     const open = allOpen();
@@ -86,21 +153,25 @@ export default async function renderTasks(root, ctx) {
         onAction: () => newTask(),
       });
     }
-    const undated = open.filter((t) => !t.scheduledDate && !t.dueDate);
     const dated = open.filter((t) => t.scheduledDate || t.dueDate)
       .sort((a, b) => String(a.scheduledDate || a.dueDate).localeCompare(String(b.scheduledDate || b.dueDate)));
+    const undated = open.filter((t) => !t.scheduledDate && !t.dueDate);
 
-    return h('div', {}, [
-      dated.length
-        ? h('div.card', {}, [h('div.task-list', {}, dated.map(rowFor))])
-        : null,
+    const group = h(`div.todo-group${openCollapsed ? '.collapsed' : ''}`, {});
+    const head = groupHead('进行中', open.length);
+    head.addEventListener('click', () => {
+      openCollapsed = !openCollapsed;
+      group.classList.toggle('collapsed', openCollapsed);
+    });
+    group.appendChild(head);
+    group.appendChild(h('div.card.todo-list-card', {}, [
+      h('div.task-list', {}, dated.map(rowFor)),
       undated.length
-        ? h('div.card.mt2', {}, [
-            h('div.tiny.muted.mb1', {}, `未安排日期（${undated.length}）—— 不设日期也不会从列表里消失`),
-            h('div.task-list', {}, undated.map(rowFor)),
-          ])
+        ? h('div.todo-divider', {}, `未安排日期 · ${undated.length}`)
         : null,
-    ]);
+      h('div.task-list', {}, undated.map(rowFor)),
+    ]));
+    return group;
   }
 
   function todayView() {
@@ -117,11 +188,11 @@ export default async function renderTasks(root, ctx) {
     }
     return h('div', {}, [
       open.length
-        ? h('div.card', {}, [h('div.task-list', {}, open.map(rowFor))])
+        ? openGroup('今天', open)
         : h('div.notice.quiet', {}, '今天的都做完了。'),
       doneToday.length
         ? h('div.card.mt2', {}, [
-            h('div.tiny.muted.mb1', {}, `今天已完成（${doneToday.length}）`),
+            h('div.tiny.muted.mb1', {}, `今天已完成 · ${doneToday.length}`),
             h('div.task-list.muted-list', {}, doneToday.map(rowFor)),
           ])
         : null,
@@ -135,7 +206,7 @@ export default async function renderTasks(root, ctx) {
       return emptyState({ icon: '○', title: '还没有已完成的任务', hint: '完成一个任务后，它会出现在这里。' });
     }
     return h('div.card', {}, [
-      h('div.tiny.muted.mb1', {}, `共 ${done.length} 个。点左边的圆点可以把它恢复成未完成。`),
+      h('div.tiny.muted.mb1', {}, `已完成 · ${done.length}`),
       h('div.task-list.muted-list', {}, done.map(rowFor)),
     ]);
   }
@@ -277,7 +348,7 @@ export default async function renderTasks(root, ctx) {
   root.appendChild(
     h('div.page', {}, [
       pageHead({
-        title: '所有要做的事',
+        title: '待办与计划',
         sub: '这一页不需要 AI 也能完整使用。任务、计划、日期、状态都在你自己手上。',
         actions: [
           h('button.btn.ghost', {
@@ -285,24 +356,19 @@ export default async function renderTasks(root, ctx) {
             title: '在桌面上开一个半透明小窗，随手勾待办、开计时',
             onclick: () => launchFloatWindow(),
           }, '浮到桌面'),
-          h('button.btn', { onclick: () => openPlanForm({ onSaved: () => ctx.rerender() }) }, '＋ 新建计划'),
-          h('button.btn.primary', { onclick: () => newTask() }, '＋ 新增任务'),
+          h('button.btn.ghost', { onclick: () => openPlanForm({ onSaved: () => ctx.rerender() }) }, '＋ 新建计划'),
         ],
       }),
 
-      h('div.tabs', {}, TABS.map((t) =>
+      quickAddCard(),
+
+      h('div.tabs.mt3', {}, TABS.map((t) =>
         h(`button.tab${t.id === tab ? '.active' : ''}`, {
           onclick: () => ctx.navigate(`/tasks?tab=${t.id}`),
         }, [t.label, counts[t.id] ? h('span.tab-count', {}, String(counts[t.id])) : null])
       )),
 
       body,
-
-      h('div.notice.quiet.mt3', {}, [
-        h('strong', {}, '关于完成状态：'),
-        ' 点任务左边的圆点可以在「待开始 → 进行中 → 已完成」之间切换，点过头了再点一圈就能回到未完成。',
-        ' 已完成的任务不会消失，可以在「已完成」里找回来。',
-      ]),
     ])
   );
 }

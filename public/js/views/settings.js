@@ -255,7 +255,7 @@ export default async function renderSettings(root, ctx) {
           h('div.grid.three.mt2', {}, [
             h('div.card.flat', {}, [h('div.stat', {}, [h('div.n', {}, String(stats.total || 0)), h('div.l', {}, '个任务')])]),
             h('div.card.flat', {}, [h('div.stat', {}, [h('div.n', {}, String(stats.plans || 0)), h('div.l', {}, '个进行中计划')])]),
-            h('div.card.flat', {}, [h('div.stat', {}, [h('div.n', {}, String(stats.archives || 0)), h('div.l', {}, '份档案')])]),
+            h('div.card.flat', {}, [h('div.stat', {}, [h('div.n', {}, String(stats.conversations || 0)), h('div.l', {}, '个对话')])]),
           ]),
           h('div.btn-row.mt2', {}, [
             h('a.btn', { href: '/api/export?format=json', download: '' }, '导出任务、对话与档案（JSON）'),
@@ -274,7 +274,7 @@ export default async function renderSettings(root, ctx) {
             h('li', {}, 'AI 建议和正式任务分开保存，只有你确认过的行动才会创建成任务。'),
             h('li', {}, '原始记录和 AI 整理的内容分开存放，改摘要不会覆盖原始对话。'),
             h('li', {}, '没有强制打卡、连续使用奖励和排行榜。'),
-            h('li', {}, '未实现的功能明确标着「规划中」，不会给你一个点不动的空壳。'),
+            h('li', {}, '界面里只放已经能用的功能，不会拿点不动的入口占位置。'),
           ]),
           h('p.tiny.muted.mb0', {}, '它不是医疗或心理治疗工具。如果情绪已经明显影响到睡眠、饮食或日常生活，请找专业的人聊一聊。'),
         ]),

@@ -3,11 +3,14 @@
  * ---------------------------------------------------------------
  * 导入在浏览器里完成文字提取，服务端保存并整理框架。
  * 文字层不可读时，服务端用 Windows 本机 OCR 识别目录和正文，并如实标注来源。
+ *
+ * 版式按图书馆卡片目录收敛：大标题、细线分隔、深色表头，
+ * 每本教材是一行目录记录；导入按钮和拖拽入口都收在页头附近。
  */
 
 import { api } from '../api.js';
 import {
-  h, toast, toastError, confirmDialog, pageHead, emptyState, fmtRelative,
+  h, toast, toastError, confirmDialog, emptyState, fmtRelative,
 } from '../ui.js';
 import { state } from '../state.js';
 import { importTextbookFromFile, formatBytes } from '../pdf-import.js';
@@ -15,7 +18,7 @@ import { importTextbookFromFile, formatBytes } from '../pdf-import.js';
 const STATUS_LABEL = {
   imported: '待整理',
   analyzing: '整理中',
-  ready: '可以阅读',
+  ready: '可阅读',
   error: '整理失败',
 };
 
@@ -48,7 +51,21 @@ export default async function renderTextbooks(root, ctx) {
     loadError = err;
   }
 
-  const page = h('div.page.textbooks-page');
+  const page = h('div.page.textbooks-page', {
+    ondragover: (e) => {
+      e.preventDefault();
+      page.classList.add('dragging');
+    },
+    ondragleave: (e) => {
+      if (!e.relatedTarget || !page.contains(e.relatedTarget)) page.classList.remove('dragging');
+    },
+    ondrop: (e) => {
+      e.preventDefault();
+      page.classList.remove('dragging');
+      const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (file) runImport(file);
+    },
+  });
   root.appendChild(page);
   let progressHost = null;
 
@@ -64,39 +81,15 @@ export default async function renderTextbooks(root, ctx) {
   });
   page.appendChild(fileInput);
 
-  page.appendChild(pageHead({
-    title: '教材精读',
-    sub: '把 PDF 教材导入进来，按章节读讲义、看原文、随时提问。',
-    actions: [
-      h('button.btn.primary', { onclick: () => fileInput.click() }, '＋ 导入 PDF 教材'),
-    ],
-  }));
-
-  page.appendChild(renderImportZone());
+  page.appendChild(renderCatalogHero());
   progressHost = h('div.textbook-import-progress-wrap');
   page.appendChild(progressHost);
 
-  page.appendChild(h('div.section', {}, [
-    h('div.section-head.inline', {}, [
-      h('h2', {}, '我的书架'),
-      h('span.count', {}, books.length ? `${books.length} 本` : ''),
-    ]),
-    loadError
-      ? h('div.notice.alert', {}, ['书架没读出来：', loadError.message || String(loadError)])
-      : books.length
-        ? h('div.textbook-grid', {}, books.map(renderBookCard))
-        : emptyState({
-            icon: '▤',
-            title: '书架还是空的',
-            hint: '导入一本 PDF 教材。文字层不可读的扫描版会尝试用本机 Windows OCR 识别。',
-            actionLabel: '选择 PDF 文件',
-            onAction: () => fileInput.click(),
-          }),
-  ]));
+  page.appendChild(renderCatalog());
 
-  page.appendChild(h('div.card.textbook-notes', {}, [
-    h('h3.mb1', {}, '导入前，先了解这几件事'),
-    h('ul.small.muted.mb0', {}, [
+  page.appendChild(h('details.card.catalog-notes', {}, [
+    h('summary', {}, '导入前，先了解这几件事'),
+    h('ul.small.muted.mb0.mt2', {}, [
       h('li', {}, '教材正文会保存在本机 data/textbooks/，原始 PDF 也会留一份，方便对照原页。'),
       h('li', {}, '章节框架优先用 PDF 书签；没有书签时会尝试识别目录页和正文标题，仍认不出来就按页分段，并如实告诉你来源。'),
       h('li', {}, '文字层是乱码或空白时，服务端会用 Windows 本机 OCR 识别目录；正文只在你打开某一节时识别那几页，不会一上来 OCR 整本书。'),
@@ -106,33 +99,71 @@ export default async function renderTextbooks(root, ctx) {
     ]),
   ]));
 
-  // ---------------------------------------------------------------- 导入
+  // ---------------------------------------------------------------- 目录页头
 
-  function renderImportZone() {
-    const zone = h('div.textbook-drop', {
-      role: 'button',
-      tabindex: '0',
-      onclick: () => fileInput.click(),
-      onkeydown: (e) => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
-      },
-      ondragover: (e) => { e.preventDefault(); zone.classList.add('dragging'); },
-      ondragleave: () => zone.classList.remove('dragging'),
-      ondrop: (e) => {
-        e.preventDefault();
-        zone.classList.remove('dragging');
-        const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-        if (file) runImport(file);
-      },
-    }, [
-      h('div.textbook-drop-icon', {}, '⇧'),
-      h('div.textbook-drop-main', {}, [
-        h('strong', {}, '把 PDF 教材拖到这里，或点一下选择文件'),
-        h('span', {}, '支持 PDF · 单本最多 3000 页 / 200MB · 扫描版会尝试本机 OCR'),
+  function catalogStats() {
+    const ready = books.filter((b) => b.status === 'ready').length;
+    const chapters = books.reduce((n, b) => n + (Number(b.chapterCount) || 0), 0);
+    const sections = books.reduce((n, b) => n + (Number(b.sectionCount) || 0), 0);
+    return { ready, chapters, sections };
+  }
+
+  function renderCatalogHero() {
+    const { ready, chapters, sections } = catalogStats();
+    const intro = loadError
+      ? '书架的目录记录没有读出来。可以刷新页面再试一次。'
+      : books.length
+        ? `共 ${books.length} 本教材，${chapters} 个章节，${sections} 个知识小节；其中 ${ready} 本可以阅读。每一行是一本教材的目录记录，点开就能继续。`
+        : '书架还是空的。把一本 PDF 教材拖进这个页面，或者用右上角的按钮选一本。';
+
+    return h('div.catalog-hero', {}, [
+      h('div.catalog-head', {}, [
+        h('div.catalog-head-main', {}, [
+          h('div.catalog-kicker', {}, '教材精读 · THE STACKS'),
+          h('h1.catalog-title', {}, '教材目录'),
+          h('p.catalog-sub', {}, '选一本教材，查看它的整理记录，或继续上次的阅读。'),
+        ]),
+        h('div.catalog-actions', {}, [
+          h('button.btn.primary.catalog-import-btn', {
+            onclick: () => fileInput.click(),
+          }, '＋ 导入 PDF 教材'),
+          h('div.catalog-import-hint', {}, [
+            h('span', {}, '支持 PDF · 单本最多 3000 页 / 200MB'),
+            h('span', {}, '扫描版会尝试本机 OCR · 也可以把文件拖进页面'),
+          ]),
+        ]),
       ]),
-      h('span.btn', {}, '选择文件'),
+      h('div.catalog-rule', {}, [h('span', {}, '❦')]),
+      h('p.catalog-intro', {}, intro),
     ]);
-    return zone;
+  }
+
+  // ---------------------------------------------------------------- 目录表
+
+  function renderCatalog() {
+    if (loadError) {
+      return h('div.notice.alert', {}, ['书架没读出来：', loadError.message || String(loadError)]);
+    }
+    if (!books.length) {
+      return emptyState({
+        icon: '▤',
+        title: '书架还是空的',
+        hint: '导入一本 PDF 教材。文字层不可读的扫描版会尝试用本机 Windows OCR 识别。',
+        actionLabel: '选择 PDF 文件',
+        onAction: () => fileInput.click(),
+      });
+    }
+
+    return h('div.catalog-table', {}, [
+      h('div.catalog-head-row', {}, [
+        h('span', {}, '编号'),
+        h('span', {}, '教材'),
+        h('span', {}, '结构'),
+        h('span', {}, '状态'),
+        h('span', { 'aria-hidden': 'true' }),
+      ]),
+      ...books.map(renderCatalogRow),
+    ]);
   }
 
   function paintProgress(host, current) {
@@ -225,97 +256,102 @@ export default async function renderTextbooks(root, ctx) {
     }
   }
 
-  // ---------------------------------------------------------------- 书架卡片
+  // ---------------------------------------------------------------- 目录条目
 
-  function renderBookCard(book) {
+  function renderCatalogRow(book, index) {
     const ready = book.status === 'ready';
     const status = STATUS_LABEL[book.status] || book.status;
     const pct = book.progress ? book.progress.pct : 0;
-    const coverChar = String(book.title || '书').trim().charAt(0) || '书';
 
-    const card = h(`div.textbook-card${ready ? '.ready' : ''}${book.status === 'error' ? '.error' : ''}`, {
-      onclick: () => {
-        if (book.status === 'analyzing') toast('这本教材还在整理中，稍等一下。', 'warn');
-        else ctx.navigate(`/textbook/${book.id}`);
+    const metaBits = [];
+    if (book.pageCount) metaBits.push(`${book.pageCount} 页`);
+    if (book.chapterCount) metaBits.push(`${book.chapterCount} 章 · ${book.sectionCount} 节`);
+
+    const note = book.status === 'error' && book.statusMessage
+      ? book.statusMessage
+      : book.structureNote
+        || (ready ? '可以按章节阅读讲义、对照原文，并在阅读时提问。' : '导入完成后再整理章节框架。');
+
+    function openBook() {
+      if (book.status === 'analyzing') toast('这本教材还在整理中，稍等一下。', 'warn');
+      else ctx.navigate(`/textbook/${book.id}`);
+    }
+
+    return h(`div.catalog-row${ready ? '.ready' : ''}${book.status === 'error' ? '.error' : ''}`, {
+      role: 'button',
+      tabindex: '0',
+      title: book.title,
+      onclick: openBook,
+      onkeydown: (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openBook(); }
       },
     }, [
-      h('div.textbook-cover', {}, [
-        h('span.textbook-cover-char', {}, coverChar),
-        h('span.textbook-cover-meta', {}, book.pageCount ? `${book.pageCount} 页` : ''),
+      h('div.catalog-call', {}, [
+        h('span', {}, `TXT-${String(index + 1).padStart(2, '0')}`),
+        h('small', {}, 'PDF'),
       ]),
-      h('div.textbook-card-body', {}, [
-        h('div.textbook-card-top', {}, [
-          h('h3.textbook-card-title', {}, book.title),
-          h(`span.textbook-status.${book.status}`, {}, status),
-        ]),
-        h('div.textbook-card-info', {}, [
-          book.chapterCount ? `${book.chapterCount} 章 · ${book.sectionCount} 节` : `${book.pageCount || 0} 页`,
-          book.fileSize ? ` · ${formatBytes(book.fileSize)}` : '',
-          book.ocrUsed
-            ? h('span.textbook-ocr-badge', {
-                title: '正文由本机 Windows OCR 识别，公式和符号可能失真',
-              }, '本机 OCR')
-            : null,
-        ]),
+      h('div.catalog-book', {}, [
+        h('h3.catalog-book-title', {}, book.title),
+        h('p.catalog-book-sub', {}, note),
+      ]),
+      h('div.catalog-structure', {}, [
+        h('span.catalog-structure-main', {}, metaBits.join(' · ') || '还没有章节'),
+        h('span.catalog-structure-sub', {}, book.lastReadAt
+          ? `上次读于 ${fmtRelative(book.lastReadAt)}`
+          : ready ? '还没有开始读' : `导入于 ${fmtRelative(book.createdAt)}`),
         ready
-          ? h('div.textbook-card-progress', {}, [
+          ? h('div.catalog-progress', {}, [
               h('div.progress', {}, [h('i', { style: { width: `${pct}%` } })]),
-              h('span.tiny.muted', {}, `${pct}%`),
+              h('em', {}, `${pct}%`),
             ])
           : null,
-        book.status === 'error' && book.statusMessage
-          ? h('div.textbook-card-error', {}, book.statusMessage)
-          : null,
-        h('div.textbook-card-foot', {}, [
-          h('span.tiny.muted', {}, book.lastReadAt
-            ? `上次读于 ${fmtRelative(book.lastReadAt)}`
-            : book.status === 'ready' ? '还没有开始读' : `导入于 ${fmtRelative(book.createdAt)}`),
-          h('div.btn-row', {}, [
-            book.status === 'error' || book.status === 'imported'
-              ? h('button.btn.small', {
-                  onclick: async (e) => {
-                    e.stopPropagation();
-                    const btn = e.currentTarget;
-                    btn.disabled = true;
-                    btn.textContent = '整理中…';
-                    try {
-                      await api.analyzeTextbook(book.id);
-                      toast('整理好了。');
-                      await ctx.rerender();
-                    } catch (err) {
-                      toastError(err);
-                      btn.disabled = false;
-                      btn.textContent = '重试分析';
-                    }
-                  },
-                }, book.status === 'imported' ? '开始整理' : '重试分析')
-              : null,
-            ready
-              ? h('button.btn.small.primary', {
-                  onclick: (e) => { e.stopPropagation(); ctx.navigate(`/textbook/${book.id}`); },
-                }, '继续阅读')
-              : null,
-            h('button.icon-btn.danger', {
-              title: '删除这本教材',
-              onclick: async (e) => {
-                e.stopPropagation();
-                const ok = await confirmDialog(
-                  '删掉这本教材？',
-                  `《${book.title}》的框架、讲义、问答和原始 PDF 都会删除，无法恢复。`,
-                  '删掉'
-                );
-                if (!ok) return;
-                try {
-                  await api.deleteTextbook(book.id);
-                  toast('教材已删除。');
-                  await ctx.rerender();
-                } catch (err) { toastError(err); }
-              },
-            }, '×'),
-          ]),
-        ]),
       ]),
+      h('div.catalog-status', {}, [
+        h(`span.catalog-status-text.${book.status}`, {}, status),
+        book.ocrUsed
+          ? h('span.catalog-ocr', { title: '正文由本机 Windows OCR 识别，公式和符号可能失真' }, '本机 OCR')
+          : null,
+        ready
+          ? h('button.catalog-link', {
+              onclick: (e) => { e.stopPropagation(); ctx.navigate(`/textbook/${book.id}`); },
+            }, ['继续阅读', h('span', {}, '→')])
+          : book.status === 'error' || book.status === 'imported'
+            ? h('button.catalog-link.warm', {
+                onclick: async (e) => {
+                  e.stopPropagation();
+                  const btn = e.currentTarget;
+                  btn.disabled = true;
+                  btn.textContent = '整理中…';
+                  try {
+                    await api.analyzeTextbook(book.id);
+                    toast('整理好了。');
+                    await ctx.rerender();
+                  } catch (err) {
+                    toastError(err);
+                    btn.disabled = false;
+                    btn.textContent = '重试分析';
+                  }
+                },
+              }, book.status === 'imported' ? '开始整理' : '重试分析')
+            : null,
+      ]),
+      h('button.icon-btn.danger.catalog-delete', {
+        title: '删除这本教材',
+        onclick: async (e) => {
+          e.stopPropagation();
+          const ok = await confirmDialog(
+            '删掉这本教材？',
+            `《${book.title}》的框架、讲义、问答和原始 PDF 都会删除，无法恢复。`,
+            '删掉'
+          );
+          if (!ok) return;
+          try {
+            await api.deleteTextbook(book.id);
+            toast('教材已删除。');
+            await ctx.rerender();
+          } catch (err) { toastError(err); }
+        },
+      }, '×'),
     ]);
-    return card;
   }
 }

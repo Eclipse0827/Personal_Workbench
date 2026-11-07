@@ -25,8 +25,20 @@ const { spawn } = require('child_process');
 
 const db = require('./db');
 const models = require('./models');
+const projectLib = require('./projects');
 const ai = require('./ai');
 const textbook = require('./textbook');
+const articles = require('./articles');
+const articleAI = require('./article-ai');
+const contextLib = require('./context');
+const {
+  localDayKey,
+  focusContentKey,
+  focusTitleKey,
+  resolveFocusAlias,
+  focusAliasList,
+  focusStats,
+} = require('./focus-stats');
 const { runMigrations, rememberDismissed } = require('./migrate');
 
 const PUBLIC_DIR = path.join(db.ROOT, 'public');
@@ -139,17 +151,6 @@ function readRawBody(req, limit) {
   });
 }
 
-/** 本地日历日，避免用 UTC 切日期导致「今天」在晚上八点就变了 */
-function localDayKey(value) {
-  const d = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(d.getTime())) return '';
-  return [
-    d.getFullYear(),
-    String(d.getMonth() + 1).padStart(2, '0'),
-    String(d.getDate()).padStart(2, '0'),
-  ].join('-');
-}
-
 async function serveStatic(req, res, pathname) {
   let rel = decodeURIComponent(pathname);
   if (rel === '/' || rel === '') rel = '/index.html';
@@ -170,9 +171,10 @@ async function serveStatic(req, res, pathname) {
 /** 工作台需要的统计，一次算完，避免首屏发一堆请求 */
 async function buildOverview() {
   const today = models.todayStr();
-  const [tasks, plans, archives, conversations, focusSessions, textbooks] = await Promise.all([
+  const [tasks, plans, projects, archives, conversations, focusSessions, textbooks] = await Promise.all([
     db.listSorted('tasks'),
     db.listSorted('plans'),
+    db.listSorted('projects'),
     db.listSorted('archives'),
     db.listSorted('conversations'),
     db.listSorted('focusSessions'),
@@ -210,6 +212,7 @@ async function buildOverview() {
     today,
     tasks,
     plans: plans.map((p) => ({ ...p, stats: planStats.get(p.id) || { total: 0, done: 0 } })),
+    projects: projects.map(projectLib.publicProject),
     archives,
     byDate: [...byDate.entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
     conversations: conversations.map((c) => ({
@@ -229,6 +232,7 @@ async function buildOverview() {
       done: tasks.length - open.length,
       overdue: overdue.length,
       plans: plans.filter((p) => p.status === 'active').length,
+      projects: projects.length,
       archives: archives.length,
       conversations: conversations.length,
       focusToday: focusToday.length,
@@ -243,6 +247,50 @@ async function buildOverview() {
 }
 
 // ---------------------------------------------------------------- 任务
+
+/**
+ * 把任务上的项目和课程关联统一校验一遍。
+ * `undefined` 表示这次不改，null / 空字符串表示解除关联。
+ */
+async function resolveTaskLinks(input, current = {}) {
+  let projectId = input.projectId !== undefined
+    ? (input.projectId ? String(input.projectId).trim() : null)
+    : (current.projectId || null);
+  let courseId = input.courseId !== undefined
+    ? (input.courseId ? String(input.courseId).trim() : null)
+    : (current.courseId || null);
+
+  // 只给了课程：从课程反推出它所属的项目，避免存出「无项目的课程」
+  if (courseId && !projectId) {
+    const found = projectLib.locateCourse(await db.list('projects'), courseId);
+    if (!found) throw badRequest('找不到要关联的课程');
+    projectId = found.project.id;
+  }
+
+  if (projectId) {
+    const project = await db.getOrNull('projects', projectId);
+    if (!project) throw badRequest('找不到要关联的学习项目');
+    if (courseId && !projectLib.findCourse(project, courseId)) {
+      throw badRequest('找不到要关联的课程');
+    }
+  } else {
+    courseId = null;
+  }
+
+  return { projectId, courseId };
+}
+
+async function detachTasksFromCourse(courseId) {
+  const tasks = await db.list('tasks');
+  let removed = 0;
+  for (const task of tasks) {
+    if (task.courseId !== courseId) continue;
+    task.courseId = null;
+    await db.put('tasks', task);
+    removed += 1;
+  }
+  return removed;
+}
 
 async function handleTasks(req, res, seg, query) {
   const method = req.method.toUpperCase();
@@ -259,6 +307,10 @@ async function handleTasks(req, res, seg, query) {
       else if (filter === 'overdue') out = tasks.filter((t) => models.isOverdue(t, today));
       const planId = query.get('planId');
       if (planId) out = out.filter((t) => t.planId === planId);
+      const projectId = query.get('projectId');
+      if (projectId) out = out.filter((t) => t.projectId === projectId);
+      const courseId = query.get('courseId');
+      if (courseId) out = out.filter((t) => t.courseId === courseId);
       return sendJson(res, 200, { tasks: out });
     }
     if (method === 'POST') {
@@ -268,7 +320,8 @@ async function handleTasks(req, res, seg, query) {
         const plan = await db.getOrNull('plans', body.planId);
         if (!plan) throw badRequest('找不到要关联的计划');
       }
-      const task = models.newTask({ ...body, source: 'manual' });
+      const links = await resolveTaskLinks(body);
+      const task = models.newTask({ ...body, ...links, source: 'manual' });
       await db.put('tasks', task);
       return sendJson(res, 201, { task });
     }
@@ -284,6 +337,9 @@ async function handleTasks(req, res, seg, query) {
       if (body.planId) {
         const plan = await db.getOrNull('plans', body.planId);
         if (!plan) throw badRequest('找不到要关联的计划');
+      }
+      if (body.projectId !== undefined || body.courseId !== undefined) {
+        Object.assign(body, await resolveTaskLinks(body, task));
       }
       models.patchTask(task, body);
       await db.put('tasks', task);
@@ -368,9 +424,166 @@ async function handlePlans(req, res, seg) {
   throw Object.assign(new Error('没有这个接口'), { status: 404 });
 }
 
+// ---------------------------------------------------------------- 学习项目
+
+async function handleProjects(req, res, seg) {
+  const method = req.method.toUpperCase();
+
+  if (seg.length === 2) {
+    if (method === 'GET') {
+      const list = await db.listSorted('projects');
+      return sendJson(res, 200, { projects: list.map(projectLib.publicProject) });
+    }
+    if (method === 'POST') {
+      const body = await readBody(req);
+      if (!body.title || !String(body.title).trim()) throw badRequest('给这个学习项目起个名字');
+      const project = projectLib.newProject(body);
+      await db.put('projects', project);
+      return sendJson(res, 201, { project: projectLib.publicProject(project) });
+    }
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  const id = seg[2];
+
+  if (seg.length === 3) {
+    if (method === 'GET') {
+      const project = await db.get('projects', id);
+      return sendJson(res, 200, { project: projectLib.publicProject(project) });
+    }
+    if (method === 'PATCH') {
+      const body = await readBody(req);
+      const project = await db.get('projects', id);
+      projectLib.patchProject(project, body);
+      await db.put('projects', project);
+      return sendJson(res, 200, { project: projectLib.publicProject(project) });
+    }
+    if (method === 'DELETE') {
+      const project = await db.getOrNull('projects', id);
+      if (!project) throw Object.assign(new Error('这个学习项目已经不在了'), { status: 404 });
+      const courseIds = new Set((project.courses || []).map((c) => c.id));
+      const tasks = await db.list('tasks');
+      let detachedTasks = 0;
+      for (const task of tasks) {
+        const touchProject = task.projectId === id;
+        const touchCourse = task.courseId && courseIds.has(task.courseId);
+        if (!touchProject && !touchCourse) continue;
+        // 只清除关联，任务本身必须原样保留
+        task.projectId = null;
+        task.courseId = null;
+        await db.put('tasks', task);
+        detachedTasks += 1;
+      }
+      await db.remove('projects', id);
+      return sendJson(res, 200, { ok: true, detachedTasks });
+    }
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  if (seg[3] !== 'courses') throw Object.assign(new Error('没有这个接口'), { status: 404 });
+
+  if (seg.length === 4) {
+    const project = await db.get('projects', id);
+    if (method === 'GET') {
+      return sendJson(res, 200, {
+        project: projectLib.publicProject(project),
+        courses: (project.courses || []).map(projectLib.courseSummary),
+      });
+    }
+    if (method === 'POST') {
+      const body = await readBody(req);
+      if (!body.title || !String(body.title).trim()) throw badRequest('给这门课起个名字');
+      const course = projectLib.addCourse(project, body);
+      await db.put('projects', project);
+      return sendJson(res, 201, {
+        project: projectLib.publicProject(project),
+        course: projectLib.courseSummary(course),
+      });
+    }
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  const courseId = seg[4];
+  const project = await db.get('projects', id);
+
+  if (seg.length === 5) {
+    const course = projectLib.findCourse(project, courseId);
+    if (!course) throw Object.assign(new Error('找不到这门课程'), { status: 404 });
+
+    if (method === 'GET') {
+      return sendJson(res, 200, {
+        project: projectLib.publicProject(project),
+        course: projectLib.courseSummary(course),
+      });
+    }
+    if (method === 'PATCH') {
+      const body = await readBody(req);
+      projectLib.patchCourse(course, body);
+      await db.put('projects', project);
+      return sendJson(res, 200, {
+        project: projectLib.publicProject(project),
+        course: projectLib.courseSummary(course),
+      });
+    }
+    if (method === 'DELETE') {
+      projectLib.removeCourse(project, courseId);
+      // 删除课程只解除任务上的课程关联，任务和它所属的项目都保留
+      const detachedTasks = await detachTasksFromCourse(courseId);
+      await db.put('projects', project);
+      return sendJson(res, 200, {
+        ok: true,
+        detachedTasks,
+        project: projectLib.publicProject(project),
+      });
+    }
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  if (seg.length === 6) {
+    if (method !== 'POST') throw Object.assign(new Error('不支持的方法'), { status: 405 });
+    const course = projectLib.findCourse(project, courseId);
+    if (!course) throw Object.assign(new Error('找不到这门课程'), { status: 404 });
+
+    const action = seg[5];
+    if (action === 'continue') {
+      const result = projectLib.openForStudy(course);
+      await db.put('projects', project);
+      return sendJson(res, 200, {
+        project: projectLib.publicProject(project),
+        course: projectLib.courseSummary(course),
+        ...result,
+      });
+    }
+    if (action === 'complete') {
+      const result = projectLib.completeCurrent(course);
+      await db.put('projects', project);
+      return sendJson(res, 200, {
+        project: projectLib.publicProject(project),
+        course: projectLib.courseSummary(course),
+        ...result,
+      });
+    }
+  }
+
+  throw Object.assign(new Error('没有这个接口'), { status: 404 });
+}
+
 // ---------------------------------------------------------------- 对话与方案
 
-async function handleConversations(req, res, seg) {
+/** 预览接口的查询参数 → 选择对象；没有任何参数时沿用对话里保存的选择 */
+function selectionFromQuery(query) {
+  const keys = ['projectId', 'windowDays', 'includeTasks', 'includeKnowledge'];
+  if (!query || !keys.some((key) => query.has(key))) return null;
+  const flag = (value) => value === '1' || value === 'true';
+  return {
+    projectId: query.get('projectId') || null,
+    windowDays: query.get('windowDays') || 0,
+    includeTasks: flag(query.get('includeTasks')),
+    includeKnowledge: flag(query.get('includeKnowledge')),
+  };
+}
+
+async function handleConversations(req, res, seg, query) {
   const method = req.method.toUpperCase();
 
   if (seg.length === 2) {
@@ -404,6 +617,12 @@ async function handleConversations(req, res, seg) {
       const body = await readBody(req);
       const conv = await db.get('conversations', id);
       if (typeof body.title === 'string' && body.title.trim()) conv.title = body.title.trim().slice(0, 120);
+      if (body.context !== undefined) {
+        conv.context = {
+          ...contextLib.normalizeSelection(body.context),
+          updatedAt: db.nowIso(),
+        };
+      }
       await db.put('conversations', conv);
       return sendJson(res, 200, { conversation: conv });
     }
@@ -413,6 +632,25 @@ async function handleConversations(req, res, seg) {
       return sendJson(res, 200, { ok: true });
     }
     throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  // 只读预览：这次会让 AI 参考哪些真实记录
+  if (seg.length === 4 && seg[3] === 'context' && method === 'GET') {
+    const conv = await db.get('conversations', id);
+    const override = selectionFromQuery(query);
+    let built;
+    if (override) {
+      built = await contextLib.previewContext(override);
+    } else {
+      try {
+        built = await contextLib.previewContext(conv.context);
+      } catch {
+        // 旧数据里如果存了失效的选择，降级为「不引用」，而不是让预览接口报错
+        built = await contextLib.previewContext(null);
+        built.warnings.push('保存的学习数据选择已失效，本次没有引用任何数据。');
+      }
+    }
+    return sendJson(res, 200, { selection: built.selection, context: built });
   }
 
   // 发消息
@@ -430,7 +668,19 @@ async function handleConversations(req, res, seg) {
     }
 
     const settings = await db.getSettings();
-    const result = await ai.respond({ conversation: conv, userText: text, settings });
+
+    // 每轮都按保存的选择重新构建真实上下文；历史里只存最小快照
+    let builtContext = null;
+    let contextWarning = null;
+    if (conv.context && contextLib.hasSelection(conv.context)) {
+      try {
+        builtContext = await contextLib.buildContext(conv.context);
+      } catch {
+        contextWarning = '保存的学习数据选择已失效，本轮没有引用任何数据。';
+      }
+    }
+
+    const result = await ai.respond({ conversation: conv, userText: text, settings, context: builtContext });
 
     let proposalId = null;
     if (result.proposal) {
@@ -452,6 +702,7 @@ async function handleConversations(req, res, seg) {
       proposalId,
       provider: result.provider,
       meta: result.meta || null,
+      context: builtContext ? contextLib.snapshotContext(builtContext) : null,
     });
     conv.messages.push(assistantMsg);
 
@@ -465,7 +716,7 @@ async function handleConversations(req, res, seg) {
     return sendJson(res, 201, {
       conversation: conv,
       message: assistantMsg,
-      warning: result.warning || null,
+      warning: [result.warning, contextWarning].filter(Boolean).join(' ') || null,
     });
   }
 
@@ -663,116 +914,57 @@ async function handleArchives(req, res, seg, query) {
 
 const TEXTBOOK_IMPORT_BYTES = 64 * 1024 * 1024;
 const TEXTBOOK_FILE_BYTES = 200 * 1024 * 1024;
+const ARTICLE_IMPORT_BYTES = 4 * 1024 * 1024;
 
-function focusContentKey(title) {
-  return String(title || '').replace(/\s+/g, ' ').trim() || '未命名专注';
+/**
+ * 把一种写法归到另一项。只记标题的指向，不改原始专注记录：
+ * 统计时统一换成目标标题，历史记录仍然保留当时写下的文字。
+ */
+async function mergeFocusContent(body = {}) {
+  const rawFrom = String(body.from || '');
+  const rawTo = String(body.to || '');
+  if (!rawFrom.trim() || !rawTo.trim()) throw badRequest('先选要归到哪一项');
+  if (rawFrom.length > 160 || rawTo.length > 160) throw badRequest('名称太长了');
+
+  const from = focusContentKey(rawFrom);
+  const aliases = await db.getFocusAliases();
+  const target = resolveFocusAlias(rawTo, aliases);
+  if (focusTitleKey(from) === focusTitleKey(target)) {
+    throw badRequest('这两项已经是同一个名字了，不用再归类');
+  }
+
+  const now = db.nowIso();
+  const next = { ...aliases };
+  // 已经归到 from 的写法，一并改指向目标，避免多绕一层或成环
+  for (const [key, entry] of Object.entries(aliases)) {
+    if (!entry || !entry.to) continue;
+    if (focusTitleKey(resolveFocusAlias(entry.to, aliases)) === focusTitleKey(from)) {
+      next[key] = { ...entry, to: target, updatedAt: now };
+    }
+  }
+  next[focusTitleKey(from)] = { from, to: target, updatedAt: now };
+
+  if (focusTitleKey(resolveFocusAlias(target, next)) !== focusTitleKey(target)) {
+    throw badRequest('这两项不能互相归类');
+  }
+
+  const saved = await db.saveFocusAliases(next);
+  return { alias: { from, to: target }, aliases: focusAliasList(saved) };
 }
 
-function focusSeconds(session) {
-  const seconds = Number(session && session.actualSeconds);
-  if (Number.isFinite(seconds) && seconds > 0) return Math.round(seconds);
-  return Math.max(0, Math.round((Number(session && session.minutes) || 0) * 60));
-}
+async function unmergeFocusContent(body = {}) {
+  const from = focusContentKey(body.from);
+  const aliases = await db.getFocusAliases();
+  const key = focusTitleKey(from);
+  if (!aliases[key]) throw Object.assign(new Error('这一项还没有归类'), { status: 404 });
 
-function focusStats(sessions) {
-  const valid = sessions.filter((s) => !s.undoneAt && s.mode === 'focus');
-  const now = new Date();
-  const todayKey = localDayKey(now);
-  const yesterdayKey = localDayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1));
-  const days = [];
-  const byKey = new Map();
-  for (let i = 6; i >= 0; i -= 1) {
-    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
-    const key = localDayKey(d);
-    const day = { date: key, seconds: 0, minutes: 0, sessions: 0, content: [] };
-    days.push(day);
-    byKey.set(key, day);
-  }
-
-  let totalSeconds = 0;
-  let totalSessions = 0;
-  let todaySeconds = 0;
-  let todaySessions = 0;
-  let yesterdaySeconds = 0;
-  let yesterdaySessions = 0;
-  let weekSeconds = 0;
-  let weekSessions = 0;
-  const contentAll = new Map();
-  const contentByDay = new Map();
-
-  const bump = (map, title, seconds, endedAt) => {
-    const key = title.toLowerCase();
-    let item = map.get(key);
-    if (!item) {
-      item = { title, seconds: 0, sessions: 0, lastAt: endedAt };
-      map.set(key, item);
-    }
-    item.seconds += seconds;
-    item.sessions += 1;
-    if (String(endedAt) > String(item.lastAt)) {
-      item.lastAt = endedAt;
-      item.title = title;
-    }
-  };
-
-  for (const s of valid) {
-    const seconds = focusSeconds(s);
-    const title = focusContentKey(s.title);
-    totalSeconds += seconds;
-    totalSessions += 1;
-    bump(contentAll, title, seconds, s.endedAt);
-
-    const key = localDayKey(s.endedAt);
-    const day = byKey.get(key);
-    if (!day) continue;
-    day.seconds += seconds;
-    day.sessions += 1;
-    weekSeconds += seconds;
-    weekSessions += 1;
-    if (!contentByDay.has(key)) contentByDay.set(key, new Map());
-    bump(contentByDay.get(key), title, seconds, s.endedAt);
-    if (key === todayKey) {
-      todaySeconds += seconds;
-      todaySessions += 1;
-    } else if (key === yesterdayKey) {
-      yesterdaySeconds += seconds;
-      yesterdaySessions += 1;
-    }
-  }
-
-  const withMinutes = (item) => ({
-    ...item,
-    minutes: Math.round(item.seconds / 60),
-  });
-
-  for (const day of days) {
-    day.minutes = Math.round(day.seconds / 60);
-    day.content = [...(contentByDay.get(day.date) || new Map()).values()]
-      .map(withMinutes)
-      .sort((a, b) => b.seconds - a.seconds || a.title.localeCompare(b.title, 'zh-Hans-CN'));
-  }
-
-  const byContent = [...contentAll.values()]
-    .map(withMinutes)
-    .sort((a, b) => b.seconds - a.seconds || a.title.localeCompare(b.title, 'zh-Hans-CN'));
-
+  const next = { ...aliases };
+  const removed = next[key];
+  delete next[key];
+  const saved = await db.saveFocusAliases(next);
   return {
-    todayKey,
-    yesterdayKey,
-    totalSessions,
-    totalSeconds,
-    totalMinutes: Math.round(totalSeconds / 60),
-    todayMinutes: Math.round(todaySeconds / 60),
-    todaySeconds,
-    todaySessions,
-    yesterdayMinutes: Math.round(yesterdaySeconds / 60),
-    yesterdaySeconds,
-    yesterdaySessions,
-    weekMinutes: Math.round(weekSeconds / 60),
-    weekSeconds,
-    weekSessions,
-    byDay: days,
-    byContent,
+    removed: { from: focusContentKey(removed.from), to: resolveFocusAlias(removed.to, aliases) },
+    aliases: focusAliasList(saved),
   };
 }
 
@@ -1017,17 +1209,27 @@ async function handleFocus(req, res, seg) {
 
   if (seg.length === 2) {
     if (method !== 'GET') throw Object.assign(new Error('不支持的方法'), { status: 405 });
-    const all = await db.listSorted('focusSessions');
+    const [all, aliases, active] = await Promise.all([
+      db.listSorted('focusSessions'),
+      db.getFocusAliases(),
+      db.getActiveFocus(),
+    ]);
     const sessions = [...all]
       .sort((a, b) => String(b.endedAt || b.createdAt).localeCompare(String(a.endedAt || a.createdAt)))
       .slice(0, 200);
-    const active = await db.getActiveFocus();
     return sendJson(res, 200, {
       sessions,
-      stats: focusStats(all),
+      stats: focusStats(all, aliases),
+      contentAliases: focusAliasList(aliases),
       active: publicActive(active),
       lastResult: lastFocusResult,
     });
+  }
+
+  if (seg.length === 4 && seg[2] === 'content' && method === 'POST') {
+    const body = await readBody(req);
+    if (seg[3] === 'merge') return sendJson(res, 200, await mergeFocusContent(body));
+    if (seg[3] === 'unmerge') return sendJson(res, 200, await unmergeFocusContent(body));
   }
 
   if (seg.length === 3 && seg[2] === 'sessions') {
@@ -1185,7 +1387,10 @@ async function handleTextbooks(req, res, seg, query) {
   if (!book) throw Object.assign(new Error('这本教材已经不在了'), { status: 404 });
 
   if (seg.length === 3) {
-    if (method === 'GET') return sendJson(res, 200, { book: textbook.publicBook(book) });
+    if (method === 'GET') {
+      await textbook.ensureChapterGuides(book);
+      return sendJson(res, 200, { book: textbook.publicBook(book) });
+    }
     if (method === 'PATCH') {
       const body = await readBody(req);
       if (typeof body.title === 'string' && body.title.trim()) {
@@ -1244,6 +1449,7 @@ async function handleTextbooks(req, res, seg, query) {
     if (!hit) throw Object.assign(new Error('找不到这一节'), { status: 404 });
 
     if (method === 'GET') {
+      await textbook.ensureChapterGuides(book);
       const payload = await textbook.sectionPayload(book, sectionId);
       const lesson = hit.section.lesson || null;
       const stale = Boolean(lesson) && (
@@ -1257,6 +1463,7 @@ async function handleTextbooks(req, res, seg, query) {
         lessonStale: stale,
         chat: book.chats[sectionId] || [],
         chapterTitle: hit.chapter.title,
+        chapterGuide: (book.chapterGuides || {})[hit.chapter.id] || null,
       });
     }
 
@@ -1313,6 +1520,8 @@ async function handleTextbooks(req, res, seg, query) {
       section: hit.section,
       text: payload.text,
       textInfo: payload.textInfo,
+      previous: textbook.previousSection(book, sectionId),
+      next: textbook.nextSection(book, sectionId),
     });
     lesson.textSource = payload.textInfo.source;
 
@@ -1421,14 +1630,41 @@ async function handleTextbooks(req, res, seg, query) {
     return sendJson(res, 201, { answer: assistantMsg, chat, textInfo: payload.textInfo });
   }
 
+  // 把某个问题整理成流程图：模型可用时出结构化步骤，不可用时按本地讲义退化为顺序链
+  if (seg.length === 6 && seg[3] === 'sections' && seg[5] === 'diagram' && method === 'POST') {
+    const body = await readBody(req);
+    const question = String(body.question || '').trim().slice(0, 3000);
+    const sectionId = seg[4];
+    const hit = textbook.findSection(book, sectionId);
+    if (!hit) throw Object.assign(new Error('找不到这一节'), { status: 404 });
+
+    const settings = await db.getSettings();
+    const payload = await textbook.sectionPayload(book, sectionId);
+    const diagram = await textbook.generateDiagram({
+      settings,
+      book,
+      chapter: hit.chapter,
+      section: hit.section,
+      lesson: hit.section.lesson,
+      text: payload.text,
+      question,
+    });
+    return sendJson(res, 200, { diagram });
+  }
+
   throw Object.assign(new Error('没有这个接口'), { status: 404 });
 }
 
 // ---------------------------------------------------------------- 导出
 
-function toMarkdown({ tasks, plans, archives, conversations }) {
+function toMarkdown({ tasks, plans, projects = [], archives, conversations }) {
   const L = [];
   const when = (iso) => (iso ? new Date(iso).toLocaleString('zh-CN') : '—');
+  const projectNames = new Map(projects.map((p) => [p.id, p.title]));
+  const courseNames = new Map();
+  for (const p of projects) {
+    for (const c of p.courses || []) courseNames.set(c.id, c.title);
+  }
   L.push('# 缓一缓 · 我的工作台数据');
   L.push('');
   L.push(`导出时间：${new Date().toLocaleString('zh-CN')}`);
@@ -1451,6 +1687,39 @@ function toMarkdown({ tasks, plans, archives, conversations }) {
     L.push('');
   }
 
+  L.push('## 学习项目');
+  L.push('');
+  if (!projects.length) L.push('（暂无）');
+  for (const raw of projects) {
+    const p = projectLib.publicProject(raw);
+    L.push(`### ${p.title}`);
+    L.push('');
+    if (p.description) L.push(`- 说明：${p.description}`);
+    L.push(`- 项目进度：${
+      p.progress.percent === null
+        ? '暂不可计算（还没有课程填写总集数）'
+        : `${p.progress.percent}%（已完成 ${p.progress.completedEpisodes} / 共 ${p.progress.totalEpisodes} 集）`
+    }`);
+    if (p.progress.coursesWithoutTotal) {
+      L.push(`- 另有 ${p.progress.coursesWithoutTotal} 门课程未填写总集数，不参与进度计算`);
+    }
+    L.push('');
+    for (const c of p.courses) {
+      const platform = projectLib.COURSE_PLATFORM_LABEL[c.platform] || c.platform;
+      const progress = c.totalEpisodes > 0
+        ? `${c.completedEpisodes}/${c.totalEpisodes} 集（${c.percent}%）`
+        : `已完成 ${c.completedEpisodes} 集 · 总集数未填`;
+      L.push(`#### ${c.title}`);
+      L.push('');
+      L.push(`- 平台：${platform} · ${progress}`);
+      if (c.lastEpisode > 0) L.push(`- 最近学习：第 ${c.lastEpisode} 集`);
+      if (c.lastStudiedAt) L.push(`- 最近打开：${when(c.lastStudiedAt)}`);
+      if (c.source) L.push(`- 备注：${c.source}`);
+      if (c.url) L.push(`- 链接：${c.url}`);
+      L.push('');
+    }
+  }
+
   L.push('## 任务');
   L.push('');
   if (!tasks.length) L.push('（暂无）');
@@ -1460,6 +1729,8 @@ function toMarkdown({ tasks, plans, archives, conversations }) {
       models.TASK_PRIORITY_LABEL[t.priority],
       t.scheduledDate ? `安排 ${t.scheduledDate}` : '',
       t.dueDate ? `截止 ${t.dueDate}` : '',
+      t.projectId && projectNames.has(t.projectId) ? `项目：${projectNames.get(t.projectId)}` : '',
+      t.courseId && courseNames.has(t.courseId) ? `课程：${courseNames.get(t.courseId)}` : '',
       t.source === 'ai' ? '来自 AI 建议' : '手动创建',
     ].filter(Boolean).join(' · ');
     L.push(`- [${t.status === 'done' ? 'x' : ' '}] ${t.title}`);
@@ -1601,6 +1872,267 @@ function launchFloatWindow() {
   return { ok: true, url };
 }
 
+// ---------------------------------------------------------------- 外刊阅读
+
+async function loadArticle(id) {
+  const article = await db.get('articles', id);
+  const paragraphs = await db.readArticleContent(id);
+  return { article, paragraphs };
+}
+
+function aiFailure(err) {
+  if (err && err.status) return err;
+  return Object.assign(new Error((err && err.message) || 'AI 调用失败'), { status: 502 });
+}
+
+async function handleArticles(req, res, seg, query) {
+  const method = req.method.toUpperCase();
+
+  if (seg.length === 2) {
+    if (method === 'GET') {
+      const list = await db.listSorted('articles');
+      return sendJson(res, 200, { articles: list.map(articles.articleSummary) });
+    }
+    if (method === 'POST') {
+      const body = await readBody(req, ARTICLE_IMPORT_BYTES);
+      const format = ['md', 'markdown', 'pdf'].includes(body.format) ? body.format : 'plain';
+      const paragraphs = articles.parseArticleText(body.text, format);
+      const firstHeading = paragraphs.find((p) => p.kind === 'heading' && p.text);
+      const fileName = String(body.fileName || '').replace(/[\r\n]/g, '').slice(0, 260);
+      const title = String(body.title || '').trim().slice(0, 200)
+        || (firstHeading && firstHeading.text)
+        || fileName.replace(/\.[^.]+$/, '')
+        || '未命名外刊';
+      const article = articles.newArticleRecord({
+        title,
+        source: body.source,
+        author: body.author,
+        issue: body.issue,
+        url: body.url,
+        format,
+        fileName,
+        paragraphs,
+      });
+      if (body.tags !== undefined) articles.patchArticle(article, { tags: body.tags });
+      await db.put('articles', article);
+      await db.writeArticleContent(article.id, paragraphs);
+      return sendJson(res, 201, { article: articles.articleDetail(article) });
+    }
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  const id = seg[2];
+  const { article, paragraphs } = await loadArticle(id);
+
+  if (seg.length === 3) {
+    if (method === 'GET') {
+      return sendJson(res, 200, { article: articles.articleDetail(article), paragraphs });
+    }
+    if (method === 'PATCH') {
+      const body = await readBody(req);
+      articles.patchArticle(article, body);
+      await db.put('articles', article);
+      return sendJson(res, 200, { article: articles.articleDetail(article) });
+    }
+    if (method === 'DELETE') {
+      await db.remove('articles', id);
+      await db.removeArticleAssets(id);
+      return sendJson(res, 200, { ok: true });
+    }
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  if (seg.length === 4 && seg[3] === 'content') {
+    if (method !== 'PUT') throw Object.assign(new Error('不支持的方法'), { status: 405 });
+    const body = await readBody(req, ARTICLE_IMPORT_BYTES);
+    const next = articles.parseArticleText(body.text, body.format || article.format);
+    articles.refreshArticleStats(article, next);
+    // 正文变了，旧的字符偏移就不再可靠：高亮和阅读位置一起清空
+    article.highlights = [];
+    article.progress = {
+      anchorParagraphId: null,
+      anchorRatio: 0,
+      percent: 0,
+      lastReadAt: null,
+    };
+    await db.writeArticleContent(id, next);
+    await db.put('articles', article);
+    return sendJson(res, 200, { article: articles.articleDetail(article), paragraphs: next });
+  }
+
+  if (seg.length === 4 && seg[3] === 'progress') {
+    if (method !== 'PATCH') throw Object.assign(new Error('不支持的方法'), { status: 405 });
+    const body = await readBody(req);
+    const progress = articles.applyProgress(article, paragraphs, body);
+    await db.put('articles', article);
+    return sendJson(res, 200, { progress });
+  }
+
+  if (seg.length === 4 && seg[3] === 'highlights') {
+    if (method !== 'POST') throw Object.assign(new Error('不支持的方法'), { status: 405 });
+    const body = await readBody(req);
+    const highlight = articles.buildHighlight(article, paragraphs, body);
+    article.highlights.push(highlight);
+    await db.put('articles', article);
+    return sendJson(res, 201, { highlight });
+  }
+
+  if (seg.length === 5 && seg[3] === 'highlights') {
+    const highlight = articles.findHighlight(article, seg[4]);
+    if (!highlight) throw Object.assign(new Error('这条高亮已经不在了'), { status: 404 });
+    if (method === 'PATCH') {
+      const body = await readBody(req);
+      articles.buildHighlight(article, paragraphs, body, highlight);
+      await db.put('articles', article);
+      return sendJson(res, 200, { highlight });
+    }
+    if (method === 'DELETE') {
+      article.highlights = article.highlights.filter((h) => h.id !== highlight.id);
+      await db.put('articles', article);
+      return sendJson(res, 200, { ok: true });
+    }
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  if (seg.length === 4 && seg[3] === 'lookup') {
+    if (method !== 'POST') throw Object.assign(new Error('不支持的方法'), { status: 405 });
+    const body = await readBody(req);
+    const selection = articles.normalizeSelection(paragraphs, body.selection || body);
+    const settings = await db.getSettings();
+    const contextText = articles.buildLookupContext(article, paragraphs, selection);
+    try {
+      const result = await articleAI.lookup({ settings, article, selection, contextText });
+      return sendJson(res, 200, result);
+    } catch (err) {
+      throw aiFailure(err);
+    }
+  }
+
+  if (seg.length === 4 && seg[3] === 'chat') {
+    const chat = await db.readArticleChat(id);
+    if (method === 'GET') {
+      return sendJson(res, 200, { messages: chat.messages });
+    }
+    if (method === 'DELETE') {
+      await db.writeArticleChat(id, { messages: [] });
+      return sendJson(res, 200, { ok: true });
+    }
+    if (method === 'POST') {
+      const body = await readBody(req);
+      const question = String(body.content || '').trim().slice(0, articles.MAX_CHAT_CHARS);
+      if (!question) throw badRequest('说点什么吧，一句话就行');
+
+      let selection = null;
+      if (body.selection && body.selection.paragraphId) {
+        const normalized = articles.normalizeSelection(paragraphs, body.selection);
+        selection = {
+          paragraphId: normalized.paragraphId,
+          start: normalized.start,
+          end: normalized.end,
+          text: normalized.text,
+          mode: normalized.mode,
+        };
+      }
+      const anchorId = selection
+        ? selection.paragraphId
+        : (article.progress && article.progress.anchorParagraphId) || '';
+      const contextText = articles.buildChatContext(article, paragraphs, {
+        paragraphId: anchorId,
+        selectionText: selection ? selection.text : '',
+      });
+      const settings = await db.getSettings();
+      let result;
+      try {
+        result = await articleAI.chat({
+          settings,
+          article,
+          contextText,
+          question,
+          history: chat.messages.slice(-8),
+        });
+      } catch (err) {
+        throw aiFailure(err);
+      }
+
+      articles.appendChatMessage(chat, articles.newChatMessage({
+        role: 'user',
+        content: question,
+        selection,
+        provider: settings.aiProvider,
+      }));
+      const reply = articles.newChatMessage({
+        role: 'assistant',
+        content: result.content,
+        provider: result.provider,
+        model: result.model,
+      });
+      articles.appendChatMessage(chat, reply);
+      await db.writeArticleChat(id, chat);
+      return sendJson(res, 200, { messages: chat.messages, reply });
+    }
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  throw Object.assign(new Error('没有这个接口'), { status: 404 });
+}
+
+async function handleVocabulary(req, res, seg) {
+  const method = req.method.toUpperCase();
+
+  if (seg.length === 2) {
+    if (method === 'GET') {
+      const list = await db.listSorted('vocabulary');
+      list.sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+      return sendJson(res, 200, { vocabulary: list });
+    }
+    if (method === 'POST') {
+      const body = await readBody(req);
+      const article = body.articleId ? await db.getOrNull('articles', body.articleId) : null;
+      if (body.articleId && !article) throw badRequest('找不到这篇文章');
+      const entry = { ...(body.entry || {}) };
+      if (!entry.term && body.term) entry.term = body.term;
+      const incoming = articles.newVocabularyRecord({
+        article: article || { id: '', title: '' },
+        contextText: body.contextText || body.selectionText || '',
+        selectionText: body.selectionText || body.term || '',
+        kind: body.kind || entry.kind,
+        entry,
+      });
+      const existing = (await db.list('vocabulary'))
+        .find((item) => item.normalized === incoming.normalized);
+      if (existing) {
+        articles.mergeVocabulary(existing, incoming);
+        await db.put('vocabulary', existing);
+        return sendJson(res, 200, { entry: existing, merged: true });
+      }
+      await db.put('vocabulary', incoming);
+      return sendJson(res, 201, { entry: incoming });
+    }
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  const id = seg[2];
+  const entry = await db.get('vocabulary', id);
+
+  if (seg.length === 3) {
+    if (method === 'PATCH') {
+      const body = await readBody(req);
+      if (typeof body.note === 'string') entry.note = body.note.trim().slice(0, 1000);
+      await db.put('vocabulary', entry);
+      return sendJson(res, 200, { entry });
+    }
+    if (method === 'DELETE') {
+      const result = await db.remove('vocabulary', id);
+      if (!result.existed) throw Object.assign(new Error('这个词已经不在了'), { status: 404 });
+      return sendJson(res, 200, { ok: true });
+    }
+    if (method === 'GET') return sendJson(res, 200, { entry });
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  throw Object.assign(new Error('没有这个接口'), { status: 404 });
+}
+
 // ---------------------------------------------------------------- 路由
 
 async function handleApi(req, res, pathname, query) {
@@ -1620,13 +2152,16 @@ async function handleApi(req, res, pathname, query) {
 
   if (seg[1] === 'tasks') return handleTasks(req, res, seg, query);
   if (seg[1] === 'plans') return handlePlans(req, res, seg);
-  if (seg[1] === 'conversations') return handleConversations(req, res, seg);
+  if (seg[1] === 'projects') return handleProjects(req, res, seg);
+  if (seg[1] === 'conversations') return handleConversations(req, res, seg, query);
   if (seg[1] === 'archives') return handleArchives(req, res, seg, query);
   if (seg[1] === 'focus') return handleFocus(req, res, seg);
   if (seg[1] === 'float' && seg[2] === 'launch' && method === 'POST') {
     return sendJson(res, 202, launchFloatWindow());
   }
   if (seg[1] === 'textbooks') return handleTextbooks(req, res, seg, query);
+  if (seg[1] === 'articles') return handleArticles(req, res, seg, query);
+  if (seg[1] === 'vocabulary') return handleVocabulary(req, res, seg);
 
   if (seg[1] === 'settings') {
     if (method === 'GET') return sendJson(res, 200, await db.getPublicSettings());
@@ -1645,14 +2180,15 @@ async function handleApi(req, res, pathname, query) {
   }
 
   if (seg[1] === 'export' && method === 'GET') {
-    const [tasks, plans, archives, conversations] = await Promise.all([
-      db.listSorted('tasks'), db.listSorted('plans'), db.listSorted('archives'), db.listSorted('conversations'),
+    const [tasks, plans, projects, archives, conversations] = await Promise.all([
+      db.listSorted('tasks'), db.listSorted('plans'), db.listSorted('projects'),
+      db.listSorted('archives'), db.listSorted('conversations'),
     ]);
     const stamp = new Date().toISOString().slice(0, 10);
     const format = query.get('format') || 'json';
 
     if (format === 'markdown' || format === 'md') {
-      const md = toMarkdown({ tasks, plans, archives, conversations });
+      const md = toMarkdown({ tasks, plans, projects, archives, conversations });
       return sendText(res, 200, md, 'text/markdown; charset=utf-8', {
         'Content-Disposition': `attachment; filename="huan-yi-huan-${stamp}.md"`,
       });
@@ -1662,8 +2198,8 @@ async function handleApi(req, res, pathname, query) {
     const payload = {
       exportedAt: db.nowIso(),
       app: '缓一缓',
-      version: 2,
-      plans, tasks, conversations, archives,
+      version: 3,
+      plans, tasks, projects, conversations, archives,
     };
     return sendText(res, 200, JSON.stringify(payload, null, 2), 'application/json; charset=utf-8', {
       'Content-Disposition': `attachment; filename="huan-yi-huan-${stamp}.json"`,

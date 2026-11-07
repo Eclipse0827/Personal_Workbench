@@ -372,7 +372,6 @@ export default async function renderChat(root, ctx) {
       suggestionBlock(prop),
       h('div.msg-foot', {}, [
         h('span.msg-time', {}, fmtRelative(msg.createdAt)),
-        h('button.btn.small.ghost', { onclick: () => openSaveSummary(msg) }, '保存为摘要'),
       ]),
     ]);
   }
@@ -453,70 +452,6 @@ export default async function renderChat(root, ctx) {
     if (!ta) return;
     ta.focus();
     if (prefix) ta.value = prefix;
-  }
-
-  // ---------------------------------------------------------------- 保存摘要
-
-  function openSaveSummary(msg) {
-    const card = msg.problemCard;
-    const defaultTitle = (conversation.title || '对话摘要').slice(0, 40);
-    const lines = [];
-    if (card && card.summary) lines.push(card.summary);
-    if (card && (card.expressed || []).length) {
-      lines.push('');
-      lines.push('困难：');
-      for (const x of card.expressed) lines.push(`- ${x}`);
-    }
-    if (card && (card.unknowns || []).length) {
-      lines.push('');
-      lines.push('还没确定：');
-      for (const x of card.unknowns) lines.push(`- ${x}`);
-    }
-    lines.push('');
-    lines.push('AI 的回复：');
-    lines.push(msg.content);
-
-    const title = h('input', { type: 'text', value: defaultTitle });
-    const content = h('textarea', { rows: 12, value: lines.join('\n') });
-
-    modal({
-      title: '保存到我的档案',
-      wide: true,
-      body: h('div', {}, [
-        h('div.notice.quiet', {}, [
-          h('strong', {}, '保存的是摘要，不是整段对话。'),
-          ' 原始对话会原样留在这里；之后改摘要也不会影响它。',
-        ]),
-        h('label.field', {}, [h('span.label-text', {}, '标题'), title]),
-        h('label.field.mb0', {}, [
-          h('span.label-text', {}, '内容'),
-          h('span.label-hint', {}, '保存前可以先改。'),
-          content,
-        ]),
-      ]),
-      actions: [
-        { label: '取消' },
-        {
-          label: '保存到档案', primary: true,
-          onClick: async () => {
-            if (!title.value.trim()) { toast('给它起个名字吧。', 'warn'); return false; }
-            if (!content.value.trim()) { toast('内容是空的。', 'warn'); return false; }
-            try {
-              await api.createArchive({
-                title: title.value,
-                content: content.value,
-                type: 'summary',
-                sourceConversationId: conversation.id,
-              });
-              toast('已保存到「我的档案」。');
-            } catch (err) {
-              toastError(err);
-              return false;
-            }
-          },
-        },
-      ],
-    });
   }
 
   // ---------------------------------------------------------------- 重绘

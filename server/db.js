@@ -27,12 +27,18 @@ const DATA_DIR = path.join(ROOT, 'data');
 const COLLECTIONS = {
   tasks: path.join(DATA_DIR, 'tasks'),
   plans: path.join(DATA_DIR, 'plans'),
+  /** 学习项目；课程作为项目里的数组一起保存，不再单独建集合 */
+  projects: path.join(DATA_DIR, 'projects'),
   conversations: path.join(DATA_DIR, 'conversations'),
   archives: path.join(DATA_DIR, 'archives'),
   /** 番茄钟完成的专注记录（计时本身在浏览器里） */
   focusSessions: path.join(DATA_DIR, 'focus-sessions'),
   /** 教材的元数据、目录结构、讲义缓存和问答；正文按页单独存放 */
   textbooks: path.join(DATA_DIR, 'textbooks'),
+  /** 外刊文章；正文和文章内对话单独存放 */
+  articles: path.join(DATA_DIR, 'articles'),
+  /** 生词本，独立于文章保存 */
+  vocabulary: path.join(DATA_DIR, 'vocabulary'),
   /** 第一版遗留的「焦虑记录」，只读保留，用于迁移，绝不删除 */
   legacyEntries: path.join(DATA_DIR, 'entries'),
 };
@@ -40,6 +46,8 @@ const COLLECTIONS = {
 /** 教材的正文与原始 PDF 不放在记录文件里：目录列表不应该每次都把整本书读进内存 */
 const TEXTBOOK_PAGES_DIR = path.join(COLLECTIONS.textbooks, 'pages');
 const TEXTBOOK_FILES_DIR = path.join(COLLECTIONS.textbooks, 'files');
+const ARTICLE_CONTENT_DIR = path.join(COLLECTIONS.articles, 'content');
+const ARTICLE_CHAT_DIR = path.join(COLLECTIONS.articles, 'chats');
 
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const META_FILE = path.join(DATA_DIR, 'meta.json');
@@ -49,6 +57,11 @@ const META_FILE = path.join(DATA_DIR, 'meta.json');
  * 两边看到的才是同一块表、同一个暂停状态。
  */
 const ACTIVE_FOCUS_FILE = path.join(DATA_DIR, 'focus-active.json');
+/**
+ * 专注内容的归类关系：「单词」「墨墨背单词」都算到「背单词」。
+ * 只保存标题之间的指向，不改写原始专注记录 —— 取消归类之后能原样恢复。
+ */
+const FOCUS_ALIASES_FILE = path.join(DATA_DIR, 'focus-aliases.json');
 
 // ---------------------------------------------------------------- 基础工具
 
@@ -57,6 +70,8 @@ function ensureDirs() {
   for (const dir of Object.values(COLLECTIONS)) fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(TEXTBOOK_PAGES_DIR, { recursive: true });
   fs.mkdirSync(TEXTBOOK_FILES_DIR, { recursive: true });
+  fs.mkdirSync(ARTICLE_CONTENT_DIR, { recursive: true });
+  fs.mkdirSync(ARTICLE_CHAT_DIR, { recursive: true });
 }
 
 function isSafeId(id) {
@@ -265,6 +280,41 @@ async function clearActiveFocus() {
   await fsp.rm(ACTIVE_FOCUS_FILE, { force: true });
 }
 
+// ---------------------------------------------------------------- 专注内容归类
+
+/** 返回 { [标题小写]: { from, to, updatedAt } }；坏数据直接跳过 */
+async function getFocusAliases() {
+  const data = await readJson(FOCUS_ALIASES_FILE, null);
+  const aliases = data && typeof data === 'object' ? data.aliases : null;
+  if (!aliases || typeof aliases !== 'object' || Array.isArray(aliases)) return {};
+  const out = {};
+  for (const [key, entry] of Object.entries(aliases)) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (typeof entry.from !== 'string' || typeof entry.to !== 'string') continue;
+    const from = entry.from.trim();
+    const to = entry.to.trim();
+    if (!from || !to) continue;
+    out[key] = { from, to, updatedAt: entry.updatedAt || null };
+  }
+  return out;
+}
+
+async function saveFocusAliases(aliases) {
+  const clean = {};
+  for (const [key, entry] of Object.entries(aliases || {})) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (typeof entry.from !== 'string' || typeof entry.to !== 'string') continue;
+    if (!entry.from.trim() || !entry.to.trim()) continue;
+    clean[key] = {
+      from: entry.from.trim(),
+      to: entry.to.trim(),
+      updatedAt: entry.updatedAt || nowIso(),
+    };
+  }
+  await atomicWrite(FOCUS_ALIASES_FILE, JSON.stringify({ aliases: clean }, null, 2));
+  return clean;
+}
+
 // ---------------------------------------------------------------- meta（迁移标记等）
 
 async function getMeta() {
@@ -320,12 +370,52 @@ async function removeTextbookAssets(id) {
   } catch { /* 目录不存在就算了 */ }
 }
 
+// ---------------------------------------------------------------- 外刊正文与文章内对话
+
+async function writeArticleContent(id, paragraphs) {
+  assertId(id);
+  await atomicWrite(
+    path.join(ARTICLE_CONTENT_DIR, `${id}.json`),
+    JSON.stringify({ id, version: 1, paragraphs }, null, 2)
+  );
+  return paragraphs;
+}
+
+async function readArticleContent(id) {
+  assertId(id);
+  const data = await readJson(path.join(ARTICLE_CONTENT_DIR, `${id}.json`), null);
+  return data && Array.isArray(data.paragraphs) ? data.paragraphs : [];
+}
+
+async function writeArticleChat(id, chat) {
+  assertId(id);
+  await atomicWrite(
+    path.join(ARTICLE_CHAT_DIR, `${id}.json`),
+    JSON.stringify({ articleId: id, messages: (chat && chat.messages) || [] }, null, 2)
+  );
+  return chat;
+}
+
+async function readArticleChat(id) {
+  assertId(id);
+  const data = await readJson(path.join(ARTICLE_CHAT_DIR, `${id}.json`), null);
+  return { articleId: id, messages: data && Array.isArray(data.messages) ? data.messages : [] };
+}
+
+async function removeArticleAssets(id) {
+  assertId(id);
+  await fsp.rm(path.join(ARTICLE_CONTENT_DIR, `${id}.json`), { force: true });
+  await fsp.rm(path.join(ARTICLE_CHAT_DIR, `${id}.json`), { force: true });
+}
+
 module.exports = {
   ROOT,
   DATA_DIR,
   COLLECTIONS,
   TEXTBOOK_PAGES_DIR,
   TEXTBOOK_FILES_DIR,
+  ARTICLE_CONTENT_DIR,
+  ARTICLE_CHAT_DIR,
   ensureDirs,
   atomicWrite,
   newId,
@@ -343,6 +433,11 @@ module.exports = {
   textbookFilePath,
   textbookFileExists,
   removeTextbookAssets,
+  writeArticleContent,
+  readArticleContent,
+  writeArticleChat,
+  readArticleChat,
+  removeArticleAssets,
   getSettings,
   getPublicSettings,
   saveSettings,
@@ -351,6 +446,9 @@ module.exports = {
   saveActiveFocus,
   clearActiveFocus,
   ACTIVE_FOCUS_FILE,
+  getFocusAliases,
+  saveFocusAliases,
+  FOCUS_ALIASES_FILE,
   getMeta,
   saveMeta,
 };

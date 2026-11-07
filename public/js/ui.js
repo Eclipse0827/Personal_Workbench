@@ -155,6 +155,7 @@ export const PLAN_STATUS_LABEL = { active: '进行中', done: '已完成', archi
 export const ARCHIVE_TYPE_LABEL = { thought: '思考档案', summary: '重要摘要', plan: '学习计划' };
 export const ARCHIVE_ORIGIN_LABEL = { manual: '我手动保存', ai: '来自 AI 对话', legacy: '从第一版迁移' };
 export const PROPOSAL_STATUS_LABEL = { pending: '待确认', confirmed: '已确认', dismissed: '已放弃' };
+export const COURSE_PLATFORM_LABEL = { bilibili: 'B 站', mooc: '慕课', other: '其他' };
 /** AI 引擎的显示名。三种实现的诚实标注，绝不把规则引擎说成「AI 模型」 */
 export const PROVIDER_LABEL = {
   mock: '本地规则引擎',
@@ -289,26 +290,29 @@ export function statusDot(task, onChange) {
 export function taskRow(task, opts = {}) {
   const { planName, onStatus, onOpen, onEdit, onDelete, showDate = true } = opts;
   const overdue = task.dueDate && task.dueDate < today() && task.status !== 'done';
+  const important = task.priority === 'important';
 
-  return h(`div.task-row${task.status === 'done' ? '.done' : ''}${overdue ? '.overdue' : ''}`, {}, [
+  return h(`div.task-row${task.status === 'done' ? '.done' : ''}${overdue ? '.overdue' : ''}${important ? '.important' : ''}`, {}, [
     statusDot(task, onStatus || (() => {})),
     h('div.task-body', { onclick: onOpen || null, style: onOpen ? { cursor: 'pointer' } : {} }, [
-      h('div.task-title', {}, [
-        task.title,
-        task.priority === 'important' ? h('span.tag.warm.tiny', { style: { marginLeft: '6px' } }, '重要') : null,
-      ]),
+      h('div.task-title', {}, task.title),
       task.description ? h('div.task-desc', {}, truncate(task.description, 80)) : null,
       h('div.task-meta', {}, [
-        showDate && task.scheduledDate ? h('span.tag.tiny', {}, fmtDay(task.scheduledDate)) : null,
+        h(`span.tag${important ? '.warm' : ''}`, {}, important ? '重要' : '普通'),
+        showDate && task.scheduledDate ? h('span.task-when', {}, `安排于 ${fmtDay(task.scheduledDate)}`) : null,
         task.dueDate
-          ? h(`span.tag.tiny${overdue ? '.alert' : ''}`, {}, `截止 ${fmtDay(task.dueDate)}`)
+          ? h(`span.task-when${overdue ? '.overdue' : ''}`, { style: overdue ? { color: 'var(--alert)' } : {} }, `截止 ${fmtDay(task.dueDate)}`)
           : null,
-        planName ? h('span.tag.tiny.calm', {}, planName) : null,
-        task.source === 'ai' ? h('span.tag.tiny.plain', { title: '来自 AI 建议，你确认后才创建' }, 'AI 建议') : null,
+        planName ? h('span.tag.calm', {}, planName) : null,
+        task.source === 'ai' ? h('span.tag.plain', { title: '来自 AI 建议，你确认后才创建' }, 'AI 建议') : null,
       ]),
     ]),
     h('div.task-actions', {}, [
-      onEdit ? h('button.icon-btn', { title: '编辑', onclick: (e) => { e.stopPropagation(); onEdit(); } }, '✎') : null,
+      onEdit ? h('button.task-clock', {
+        type: 'button',
+        title: '查看 / 修改这条待办',
+        onclick: (e) => { e.stopPropagation(); onEdit(); },
+      }, '◷') : null,
       onDelete ? h('button.icon-btn.danger', { title: '删除', onclick: (e) => { e.stopPropagation(); onDelete(); } }, '×') : null,
     ]),
   ]);
