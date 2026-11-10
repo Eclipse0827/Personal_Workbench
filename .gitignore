@@ -9,4 +9,8 @@ node_modules/
 .DS_Store
 Thumbs.db
 
+# 平板 APK 的编译产物与本地签名
+android-tablet/build/
+android-tablet/tablet-release.jks
+
 data/

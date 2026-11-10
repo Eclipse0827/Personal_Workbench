@@ -14,6 +14,7 @@ import {
 } from '../ui.js';
 import { formatBytes } from '../pdf-import.js';
 import { prepareArticleFile, textFromParagraphs } from '../article-import.js';
+import { dictionaryLinks } from '../dictionaries.js';
 
 const FORMAT_LABEL = { plain: 'TXT', md: 'MD', pdf: 'PDF' };
 const KIND_LABEL = { word: '单词', phrase: '短语', sentence: '句子' };
@@ -117,7 +118,7 @@ export default async function renderArticles(root, ctx) {
   }
 
   function tabCounts() {
-    const done = articles.filter((a) => a.progress && a.progress.percent >= 99).length;
+    const done = articles.filter((a) => Boolean(a.finishedAt)).length;
     return { done };
   }
 
@@ -137,7 +138,7 @@ export default async function renderArticles(root, ctx) {
     return h('div.article-list', {}, [
       h('div.article-list-head', {}, [
         h('span', {}, `共 ${articles.length} 篇`),
-        h('span', {}, done ? `${done} 篇已读到末尾` : '还没有读完的文章'),
+        h('span', {}, done ? `${done} 篇已读完` : '还没有标记读完的文章'),
       ]),
       ...articles.map(renderArticleRow),
     ]);
@@ -145,6 +146,7 @@ export default async function renderArticles(root, ctx) {
 
   function renderArticleRow(article) {
     const pct = article.progress ? article.progress.percent || 0 : 0;
+    const finished = Boolean(article.finishedAt);
     const words = Number(article.wordCount) || 0;
     const meta = [
       article.source,
@@ -169,7 +171,7 @@ export default async function renderArticles(root, ctx) {
     }, [
       h('div.article-row-mark', {}, [
         h('span.article-row-format', {}, FORMAT_LABEL[article.format] || 'TXT'),
-        h('span.article-row-pct', {}, pct ? `${pct}%` : '未读'),
+        h('span.article-row-pct', {}, finished ? '已读完' : pct ? `${pct}%` : '未读'),
       ]),
       h('div.article-row-main', {}, [
         h('h3.article-row-title', {}, article.title),
@@ -187,7 +189,7 @@ export default async function renderArticles(root, ctx) {
       h('div.article-row-actions', {}, [
         h('button.btn.small.primary', {
           onclick: (e) => { e.stopPropagation(); open(); },
-        }, pct ? '继续阅读' : '开始阅读'),
+        }, finished ? '再看一遍' : pct ? '继续阅读' : '开始阅读'),
         h('button.btn.small.ghost', {
           onclick: async (e) => {
             e.stopPropagation();
@@ -248,11 +250,40 @@ export default async function renderArticles(root, ctx) {
     ]);
   }
 
+  function renderVocabExample(ex) {
+    return h('div.vocab-example', {}, [
+      ex.en ? h('p.vocab-example-en', {}, ex.en) : null,
+      ex.zh ? h('p.vocab-example-zh', {}, ex.zh) : null,
+    ]);
+  }
+
+  function dictLinksRow(term, kind) {
+    if (kind === 'sentence') return null;
+    const links = dictionaryLinks(term);
+    if (!links) return null;
+    return h('div.vocab-links', {}, [
+      h('a.link-btn', { href: links.oxford, target: '_blank', rel: 'noopener' }, '牛津词典 ↗'),
+      h('a.link-btn', { href: links.eudic, target: '_blank', rel: 'noopener' }, '欧路词典 ↗'),
+    ]);
+  }
+
+  function wordGroup(label, items) {
+    if (!items || !items.length) return null;
+    return h('div.vocab-word-group', {}, [
+      h('span.tiny.muted', {}, label),
+      h('div.lookup-chips', {}, items.map((item) => h('span.lookup-chip', {
+        title: item.meaningZh || '',
+      }, item.meaningZh ? `${item.word} · ${item.meaningZh}` : item.word))),
+    ]);
+  }
+
   function paintVocabulary(host, keyword) {
     const q = String(keyword || '').trim().toLowerCase();
     const list = vocabulary.filter((entry) => {
       if (!q) return true;
-      return [entry.term, entry.definitionZh, entry.definitionEn, entry.articleTitle]
+      const extra = [...(entry.derivatives || []), ...(entry.relatedWords || [])]
+        .map((item) => `${item.word} ${item.meaningZh}`);
+      return [entry.term, entry.definitionZh, entry.definitionEn, entry.articleTitle, ...extra]
         .join(' ')
         .toLowerCase()
         .includes(q);
@@ -291,6 +322,20 @@ export default async function renderArticles(root, ctx) {
       entry.partOfSpeech ? h('p.vocab-pos', {}, entry.partOfSpeech) : null,
       entry.definitionZh ? h('p.vocab-zh', {}, entry.definitionZh) : null,
       entry.definitionEn ? h('p.vocab-en', {}, entry.definitionEn) : null,
+      entry.examples && entry.examples.length
+        ? h('div.vocab-examples', {}, [
+            h('span.tiny.muted', {}, '例句'),
+            ...entry.examples.map(renderVocabExample),
+          ])
+        : null,
+      entry.oxford && entry.oxford.examples && entry.oxford.examples.length
+        ? h('div.vocab-examples', {}, [
+            h('span.tiny.muted', {}, '牛津词典例句'),
+            ...entry.oxford.examples.map(renderVocabExample),
+          ])
+        : null,
+      wordGroup('派生词', entry.derivatives),
+      wordGroup('衍生词', entry.relatedWords),
       entry.contextMeaning
         ? h('div.vocab-context', {}, [h('span.tiny.muted', {}, '在这篇文章里'), h('p', {}, entry.contextMeaning)])
         : null,
@@ -301,10 +346,13 @@ export default async function renderArticles(root, ctx) {
               onclick: () => ctx.navigate(`/article/${entry.articleId}`),
             }, `来自《${entry.articleTitle}》`)
           : h('span.tiny.muted', {}, '没有关联文章'),
-        entry.entryProvider
-          ? h('span.tiny.muted', {}, `释义：${providerText(entry.entryProvider)}`)
-          : null,
+        entry.dictionarySource === 'oxford'
+          ? h('span.tiny.muted', {}, '英文释义与例句：牛津词典')
+          : (entry.entryProvider
+            ? h('span.tiny.muted', {}, `释义：${providerText(entry.entryProvider)}`)
+            : null),
       ]),
+      dictLinksRow(entry.term, entry.kind),
     ])));
   }
 

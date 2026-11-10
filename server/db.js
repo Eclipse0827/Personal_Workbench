@@ -213,6 +213,9 @@ function defaultSettings() {
     /** 本地 Ollama */
     ollamaUrl: 'http://127.0.0.1:11434',
     ollamaModel: '',
+    /** 牛津词典 API（可选，只用于补充官方释义和例句） */
+    oxfordAppId: '',
+    oxfordAppKey: '',
   };
 }
 
@@ -237,6 +240,8 @@ async function getPublicSettings() {
     hasApiKey: Boolean(s.apiKey),
     ollamaUrl: s.ollamaUrl,
     ollamaModel: s.ollamaModel,
+    oxfordAppId: s.oxfordAppId || '',
+    hasOxfordKey: Boolean(s.oxfordAppKey),
   };
 }
 
@@ -250,6 +255,11 @@ async function saveSettings(patch) {
   if (typeof patch.ollamaModel === 'string') next.ollamaModel = patch.ollamaModel.trim();
   if (typeof patch.apiKey === 'string' && patch.apiKey.trim() !== '') next.apiKey = patch.apiKey.trim();
   if (patch.clearApiKey === true) next.apiKey = '';
+  if (typeof patch.oxfordAppId === 'string') next.oxfordAppId = patch.oxfordAppId.trim();
+  if (typeof patch.oxfordAppKey === 'string' && patch.oxfordAppKey.trim() !== '') {
+    next.oxfordAppKey = patch.oxfordAppKey.trim();
+  }
+  if (patch.clearOxfordKey === true) next.oxfordAppKey = '';
   // 只保留约定字段，避免设置文件被塞进预期外的东西
   const clean = {
     aiProvider: next.aiProvider,
@@ -258,6 +268,8 @@ async function saveSettings(patch) {
     apiKey: next.apiKey,
     ollamaUrl: next.ollamaUrl,
     ollamaModel: next.ollamaModel,
+    oxfordAppId: next.oxfordAppId,
+    oxfordAppKey: next.oxfordAppKey,
   };
   await atomicWrite(SETTINGS_FILE, JSON.stringify(clean, null, 2));
   return getPublicSettings();

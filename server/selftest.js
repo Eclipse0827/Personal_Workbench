@@ -14,8 +14,11 @@
  */
 
 const fs = require('fs/promises');
+const http = require('http');
 const path = require('path');
 const db = require('./db');
+const llm = require('./llm');
+const articleAI = require('./article-ai');
 const contextLib = require('./context');
 const ai = require('./ai');
 const { focusStats } = require('./focus-stats');
@@ -1429,6 +1432,19 @@ async function main() {
           paragraphId: 'p-nope', ratio: 0.2,
         })).status === 400);
 
+      const finished = await req('POST', `/api/articles/${article.id}/finish`);
+      ok('标记整篇文章已读 → 200',
+        finished.status === 200 && Boolean(finished.data.finishedAt), `实际 ${finished.status}`);
+      const finishedDetail = await req('GET', `/api/articles/${article.id}`);
+      ok('重新打开仍显示这篇已读完',
+        finishedDetail.data.article.finishedAt === finished.data.finishedAt);
+      const finishedList = await req('GET', '/api/articles');
+      ok('书架列表带上读完时间',
+        finishedList.data.articles.find((a) => a.id === article.id).finishedAt === finished.data.finishedAt);
+      const unfinished = await req('DELETE', `/api/articles/${article.id}/finish`);
+      ok('可以撤销已读',
+        unfinished.status === 200 && unfinished.data.finishedAt === null, `实际 ${unfinished.status}`);
+
       const target = paragraphs.find((p) => p.kind === 'paragraph');
       const quote = target.text.slice(0, 12);
       const highlight = await req('POST', `/api/articles/${article.id}/highlights`, {
@@ -1436,9 +1452,14 @@ async function main() {
       });
       ok('添加高亮与批注 → 201', highlight.status === 201, `实际 ${highlight.status}`);
       ok('★ 高亮引用直接取自原文', highlight.data.highlight.quote === quote);
+      ok('★ 没选颜色时默认黄色', highlight.data.highlight.color === 'yellow');
       ok('越界高亮被拒绝 → 400',
         (await req('POST', `/api/articles/${article.id}/highlights`, {
           paragraphId: target.id, start: 0, end: target.text.length + 10,
+        })).status === 400);
+      ok('★ 不在白名单里的颜色被拒绝 → 400',
+        (await req('PATCH', `/api/articles/${article.id}/highlights/${highlight.data.highlight.id}`, {
+          color: 'neon',
         })).status === 400);
 
       const editedHighlight = await req('PATCH', `/api/articles/${article.id}/highlights/${highlight.data.highlight.id}`, {
@@ -1446,6 +1467,83 @@ async function main() {
       });
       ok('可以修改批注', editedHighlight.status === 200
         && editedHighlight.data.highlight.note === '改过的批注');
+
+      const recolored = await req('PATCH', `/api/articles/${article.id}/highlights/${highlight.data.highlight.id}`, {
+        color: 'blue',
+      });
+      ok('★ 只改颜色时批注与引用保持不变',
+        recolored.status === 200
+        && recolored.data.highlight.color === 'blue'
+        && recolored.data.highlight.note === '改过的批注'
+        && recolored.data.highlight.quote === quote,
+        `实际 ${recolored.status}`);
+      const recoloredDetail = await req('GET', `/api/articles/${article.id}`);
+      ok('★ 重新打开后高亮颜色仍在',
+        recoloredDetail.data.article.highlights.find((h) => h.id === highlight.data.highlight.id).color === 'blue');
+
+      const quizSaved = await req('PATCH', `/api/articles/${article.id}/quiz`, {
+        questions: [
+          {
+            stem: 'What is the main claim of the passage?',
+            options: [
+              { key: 'A', text: 'Rushing makes work better' },
+              { key: 'B', text: 'Attention matters more than speed' },
+              { key: 'C', text: 'Lists are the best tool' },
+            ],
+            answer: 'B',
+            explanation: '全文把注意力放在速度之前。',
+          },
+          {
+            stem: 'Which sentence is NOT mentioned?',
+            options: [
+              { key: 'A', text: 'Protect one unhurried hour' },
+              { key: 'B', text: 'Finish before adding' },
+              { key: 'C', text: 'Wake up before five' },
+            ],
+          },
+        ],
+      });
+      ok('导入选择题 → 200', quizSaved.status === 200, `实际 ${quizSaved.status}`);
+      ok('★ 选择题保存题干、选项、答案与解析',
+        quizSaved.data.quiz.questions.length === 2
+        && quizSaved.data.quiz.questions[0].options.length === 3
+        && quizSaved.data.quiz.questions[0].answer === 'B'
+        && quizSaved.data.quiz.questions[0].explanation.includes('注意力'));
+      const firstQuestion = quizSaved.data.quiz.questions[0];
+      ok('每道题都有稳定 id', /^qz-/.test(firstQuestion.id), firstQuestion.id);
+      ok('没有答案的题目也能保存', quizSaved.data.quiz.questions[1].answer === '');
+
+      const quizAnswered = await req('PATCH', `/api/articles/${article.id}/quiz`, {
+        questionId: firstQuestion.id, selected: 'a',
+      });
+      ok('可以保存选择并统一成大写',
+        quizAnswered.status === 200 && quizAnswered.data.quiz.questions[0].selected === 'A');
+      ok('★ 重新打开文章保留选择',
+        (await req('GET', `/api/articles/${article.id}`))
+          .data.article.quiz.questions[0].selected === 'A');
+      ok('不存在的题目 → 404',
+        (await req('PATCH', `/api/articles/${article.id}/quiz`, {
+          questionId: 'qz-nope', selected: 'A',
+        })).status === 404);
+      ok('不存在的选项 → 400',
+        (await req('PATCH', `/api/articles/${article.id}/quiz`, {
+          questionId: firstQuestion.id, selected: 'H',
+        })).status === 400);
+      ok('少于两个选项的题目会被拒绝 → 400',
+        (await req('PATCH', `/api/articles/${article.id}/quiz`, {
+          questions: [{ stem: 'Only one option', options: [{ key: 'A', text: 'one' }] }],
+        })).status === 400);
+      const quizCleared = await req('DELETE', `/api/articles/${article.id}/quiz`);
+      ok('可以清空这组选择题',
+        quizCleared.status === 200 && quizCleared.data.quiz === null);
+      const quizAgain = await req('PATCH', `/api/articles/${article.id}/quiz`, {
+        questions: [{
+          stem: 'Kept before replacing the text',
+          options: [{ key: 'A', text: 'one' }, { key: 'B', text: 'two' }],
+          answer: 'A',
+        }],
+      });
+      ok('清空后可以重新导入', quizAgain.status === 200 && quizAgain.data.quiz.questions.length === 1);
 
       const lookupMock = await req('POST', `/api/articles/${article.id}/lookup`, {
         selection: { paragraphId: target.id, start: 0, end: 4, mode: 'word' },
@@ -1475,6 +1573,8 @@ async function main() {
           term: 'mitigate', partOfSpeech: 'verb',
           definitionEn: 'make less severe', definitionZh: '减轻；缓和',
           collocations: ['mitigate risk'],
+          derivatives: [{ word: 'mitigation', partOfSpeech: 'noun', meaningZh: '缓解；减轻' }],
+          relatedWords: [{ word: 'mitigate risk', meaningZh: '降低风险' }],
           examples: [{ en: 'Steps were taken to mitigate the damage.', zh: '采取了措施减轻损害。' }],
           contextMeaning: '在这里指减少无关的干扰。',
           provider: 'mock',
@@ -1485,6 +1585,10 @@ async function main() {
       ok('生词记录来源文章与上下文',
         vocab.data.entry.articleId === article.id
         && vocab.data.entry.contextMeaning.includes('干扰'));
+      ok('★ 生词记录保存派生词与衍生词',
+        vocab.data.entry.derivatives.length === 1
+        && vocab.data.entry.derivatives[0].word === 'mitigation'
+        && vocab.data.entry.relatedWords[0].word === 'mitigate risk');
       const vocabAgain = await req('POST', '/api/vocabulary', {
         articleId: article.id,
         term: 'Mitigate',
@@ -1494,11 +1598,15 @@ async function main() {
       });
       ok('★ 同一个词再次加入会合并', vocabAgain.status === 200 && vocabAgain.data.merged === true);
       ok('合并后收录次数累加', vocabAgain.data.entry.seenCount === 2);
+      ok('合并不会丢掉已有的派生词与衍生词',
+        vocabAgain.data.entry.derivatives.length === 1
+        && vocabAgain.data.entry.relatedWords.length === 1);
       const vocabNote = await req('PATCH', `/api/vocabulary/${vocabId}`, { note: '写作时常用' });
       ok('可以给生词写备注', vocabNote.status === 200 && vocabNote.data.entry.note === '写作时常用');
       ok('生词本能列出记录',
         (await req('GET', '/api/vocabulary')).data.vocabulary.some((v) => v.id === vocabId));
 
+      await req('POST', `/api/articles/${article.id}/finish`);
       const replaced = await req('PUT', `/api/articles/${article.id}/content`, {
         text: '# A new draft\n\nOnly two paragraphs here.',
         format: 'md',
@@ -1506,9 +1614,11 @@ async function main() {
       ok('替换正文 → 200', replaced.status === 200);
       ok('替换后统计更新',
         replaced.data.article.paragraphCount === 2 && replaced.data.article.title === 'Doing Less');
-      ok('★ 替换正文会清空旧高亮与阅读位置',
+      ok('★ 替换正文会清空旧高亮、阅读位置、读完标记与选择题',
         replaced.data.article.highlights.length === 0
-        && replaced.data.article.progress.percent === 0);
+        && replaced.data.article.progress.percent === 0
+        && replaced.data.article.finishedAt === null
+        && replaced.data.article.quiz === null);
 
       const deleted = await req('DELETE', `/api/articles/${article.id}`);
       ok('删除文章 → 200', deleted.status === 200);
@@ -1540,10 +1650,19 @@ async function main() {
     ok('能如实读到当前引擎配置',
       ['mock', 'ollama', 'real'].includes(s0.data.aiProvider), s0.data.aiProvider);
 
-    const s1 = await req('PATCH', '/api/settings', { aiProvider: 'real', apiKey: 'sk-test-not-real', model: 'test-model' });
+    const s1 = await req('PATCH', '/api/settings', {
+      aiProvider: 'real',
+      apiKey: 'sk-test-not-real',
+      model: 'test-model',
+      oxfordAppId: 'test-oxford-id',
+      oxfordAppKey: 'test-oxford-key',
+    });
     ok('保存设置 → 200', s1.status === 200);
     ok('标记为已配置 Key', s1.data.hasApiKey === true);
     ok('★ 不回显 Key 明文', s1.data.apiKey === undefined);
+    ok('★ 不回显牛津 App Key 明文',
+      s1.data.oxfordAppKey === undefined && s1.data.hasOxfordKey === true);
+    ok('牛津 App ID 可以回显', s1.data.oxfordAppId === 'test-oxford-id');
 
     const exportJson = await fetch(`${BASE}/api/export?format=json`);
     const jsonText = await exportJson.text();
@@ -1564,9 +1683,12 @@ async function main() {
     ok('Markdown 标注了引擎来源', md.includes('本地模拟引擎'));
     ok('★ Markdown 里也没有 Key', !md.includes('sk-test-not-real'));
 
-    await req('PATCH', '/api/settings', { aiProvider: 'mock', clearApiKey: true });
+    await req('PATCH', '/api/settings', {
+      aiProvider: 'mock', clearApiKey: true, clearOxfordKey: true, oxfordAppId: '',
+    });
     const s2 = await req('GET', '/api/settings');
     ok('可以清掉 Key 并回到模拟引擎', s2.data.aiProvider === 'mock' && s2.data.hasApiKey === false);
+    ok('可以清掉牛津词典凭据', s2.data.hasOxfordKey === false && !s2.data.oxfordAppId);
   } finally {
     if (settingsSnapshot !== null) await db.atomicWrite(settingsFile, settingsSnapshot);
     else await fs.rm(settingsFile, { force: true });
@@ -1598,6 +1720,176 @@ async function main() {
     ok(`静态资源 ${p} → 200`, r.status === 200, `实际 ${r.status}`);
   }
   ok('目录穿越被拦下', [403, 404].includes((await fetch(`${BASE}/../../server/db.js`)).status));
+
+  // ---------------------------------------------------------------- 远程模型通道
+  console.log('\n【远程模型通道】');
+  {
+    const seen = [];
+    const seenOxford = [];
+    const stub = http.createServer((request, response) => {
+      if (request.url.startsWith('/oxford/')) {
+        seenOxford.push({
+          url: request.url,
+          appId: request.headers.app_id,
+          appKey: request.headers.app_key,
+        });
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({
+          results: [{
+            lexicalEntries: [{
+              lexicalCategory: { text: 'Noun' },
+              entries: [{
+                senses: [{
+                  definitions: ['the act of paying attention'],
+                  examples: [{ text: 'He gave the problem his full attention.' }],
+                }],
+              }],
+            }],
+          }],
+        }));
+        return;
+      }
+      let raw = '';
+      request.on('data', (chunk) => { raw += chunk; });
+      request.on('end', () => {
+        let body = {};
+        try { body = JSON.parse(raw); } catch { /* 保持空对象 */ }
+        seen.push(body);
+        if (body.model === 'stall-model') {
+          response.writeHead(200, { 'Content-Type': 'application/json' });
+          response.write('{"choices":[{"message":{"content":"');
+          return;
+        }
+        if (body.model === 'fallback-model' && body.reasoning_effort) {
+          response.writeHead(400, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({ error: { message: 'Unsupported parameter: reasoning_effort is unknown' } }));
+          return;
+        }
+        if (body.model === 'lookup-model') {
+          const content = JSON.stringify({
+            term: 'attention',
+            kind: 'word',
+            definitionZh: '注意力',
+            contextMeaning: '这里指注意力是有限的。',
+            examples: [
+              { en: 'Attention is a finite resource.', zh: '注意力是有限的资源。' },
+              { en: 'Attention is a finite resource that runs out.', zh: '注意力是有限的，会用完。' },
+              { en: 'Paying attention in a noisy café takes practice.', zh: '在嘈杂的咖啡馆里集中注意力需要练习。' },
+            ],
+          });
+          response.writeHead(200, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({ model: body.model, choices: [{ message: { content } }] }));
+          return;
+        }
+
+        if (body.model === 'gap-model') {
+          const system = String((body.messages && body.messages[0] && body.messages[0].content) || '');
+          const content = JSON.stringify(system.includes('补全') ? {
+            derivatives: [{ word: 'attentiveness', partOfSpeech: 'noun', meaningZh: '专注' }],
+            examples: [
+              { en: 'Good sleep improves your attention the next day.', zh: '睡得好能提高第二天的注意力。' },
+              { en: 'The noise made it hard to keep my attention on the page.', zh: '噪音让我很难把注意力放在书上。' },
+            ],
+          } : {
+            term: 'attention',
+            kind: 'word',
+            definitionZh: '注意力',
+            contextMeaning: '这里指注意力是有限的。',
+            examples: [],
+          });
+          response.writeHead(200, { 'Content-Type': 'application/json' });
+          response.end(JSON.stringify({ model: body.model, choices: [{ message: { content } }] }));
+          return;
+        }
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({ model: body.model, choices: [{ message: { content: 'OK' } }] }));
+      });
+    });
+    await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+    const baseUrl = `http://127.0.0.1:${stub.address().port}/v1`;
+    const baseSettings = { aiProvider: 'real', baseUrl, apiKey: 'stub-key', model: 'plain-model' };
+
+    try {
+      const out = await llm.complete({
+        settings: baseSettings, system: 's', user: 'u', disableReasoning: true, timeoutMs: 5000,
+      });
+      ok('远程模型返回内容可以解析', out.text === 'OK');
+      ok('★ 查词请求会带上关闭思考的参数', Boolean(seen[0]) && seen[0].reasoning_effort === 'none');
+
+      const fallback = await llm.complete({
+        settings: { ...baseSettings, model: 'fallback-model' },
+        system: 's', user: 'u', disableReasoning: true, timeoutMs: 5000,
+      });
+      ok('★ 接口不认识关闭思考参数时会自动重试', fallback.text === 'OK' && seen.length === 3, `请求 ${seen.length} 次`);
+      ok('重试请求不再带被拒绝的参数', Boolean(seen[2]) && seen[2].reasoning_effort === undefined);
+
+      const started = Date.now();
+      let stallMessage = '';
+      try {
+        await llm.complete({
+          settings: { ...baseSettings, model: 'stall-model' }, system: 's', user: 'u', timeoutMs: 1000,
+        });
+      } catch (err) {
+        stallMessage = err.message;
+      }
+      const waited = Date.now() - started;
+      ok('★ 响应体卡住也会按超时中止', /超过 1 秒/.test(stallMessage) && waited < 4000,
+        `${waited}ms · ${stallMessage || '没有抛错'}`);
+
+      const contextText = 'Attention is a finite resource. It runs out when you switch tasks.';
+      const looked = await articleAI.lookup({
+        settings: { ...baseSettings, model: 'lookup-model' },
+        article: {},
+        selection: { text: 'attention', mode: 'word' },
+        contextText,
+      });
+      ok('★ 例句里照抄原文的句子会被过滤',
+        looked.entry.examples.length === 1, `实际 ${looked.entry.examples.length} 条`);
+      ok('保留的是另写的常见用法例句',
+        Boolean(looked.entry.examples[0]) && looked.entry.examples[0].en.includes('noisy café'));
+      ok('★ 没有配置牛津凭据时不会请求词典接口', seenOxford.length === 0, `实际 ${seenOxford.length} 次`);
+
+      const gapFilled = await articleAI.lookup({
+        settings: { ...baseSettings, model: 'gap-model' },
+        article: {},
+        selection: { text: 'attention', mode: 'word' },
+        contextText,
+      });
+      ok('★ 首次缺例句和派生词时会再补一次',
+        gapFilled.entry.examples.length === 2 && gapFilled.entry.derivatives.length === 1,
+        `例句 ${gapFilled.entry.examples.length} 条 · 派生词 ${gapFilled.entry.derivatives.length} 个`);
+      ok('补全内容确实来自第二次请求',
+        gapFilled.entry.derivatives[0].word === 'attentiveness'
+        && gapFilled.entry.examples.some((ex) => ex.en.includes('Good sleep')));
+
+      const oxfordLooked = await articleAI.lookup({
+        settings: {
+          ...baseSettings,
+          model: 'lookup-model',
+          oxfordAppId: 'test-app-id',
+          oxfordAppKey: 'test-app-key',
+          oxfordBaseUrl: `http://127.0.0.1:${stub.address().port}/oxford`,
+        },
+        article: {},
+        selection: { text: 'attention', mode: 'word' },
+        contextText,
+      });
+      ok('★ 配置牛津词典后英文释义采用牛津数据',
+        oxfordLooked.entry.dictionarySource === 'oxford'
+        && oxfordLooked.entry.definitionEn === 'the act of paying attention');
+      ok('★ 牛津官方例句单独保留并标注来源',
+        oxfordLooked.entry.oxford.examples.length === 1
+        && oxfordLooked.entry.oxford.examples[0].en.includes('full attention'));
+      ok('牛津凭据只出现在服务端请求头里',
+        seenOxford.length === 1
+        && seenOxford[0].appId === 'test-app-id'
+        && seenOxford[0].appKey === 'test-app-key'
+        && !JSON.stringify(oxfordLooked.entry).includes('test-app-key'));
+    } finally {
+      stub.closeAllConnections();
+      await new Promise((resolve) => stub.close(resolve));
+    }
+  }
 
   // ---------------------------------------------------------------- 清理
   console.log('\n【清理本次测试数据】');

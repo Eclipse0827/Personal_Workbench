@@ -373,7 +373,19 @@ async function main() {
     kind: 'word',
     selectionText: 'attention',
     contextText: 'Attention is a finite resource.',
-    entry: { definitionZh: '注意力', provider: 'mock' },
+    entry: {
+      definitionZh: '注意力',
+      derivatives: [{ word: 'attentive', partOfSpeech: 'adj.', meaningZh: '专注的' }],
+      relatedWords: [{ word: 'pay attention to', meaningZh: '关注' }],
+      examples: [{ en: 'Attention helps you finish one thing at a time.', zh: '注意力能帮你一次做完一件事。' }],
+      dictionarySource: 'oxford',
+      oxford: {
+        label: '牛津词典',
+        definitions: ['the act of paying attention'],
+        examples: [{ en: 'He gave the problem his full attention.', zh: '' }],
+      },
+      provider: 'mock',
+    },
   });
 
   await stateMod.refresh();
@@ -897,6 +909,11 @@ async function main() {
       t.includes('JSON') && t.includes('Markdown') && t.includes('不在这两个导出文件里'));
     ok('★ 明确说明真实模型会外传数据', t.includes('会被发送到'));
     ok('说明 Key 不会外传', t.includes('不会随导出文件外传'));
+    ok('可以配置牛津词典来源',
+      t.includes('词典来源（可选）') && t.includes('Oxford App ID') && t.includes('Oxford App Key'));
+    ok('★ 说明词典只发送选中的词',
+      t.includes('只会发送选中的词') && t.includes('不会发送文章段落'));
+    ok('说明欧路没有公开的词典内容接口', t.includes('欧路词典没有公开的词典内容接口'));
     ok('不是医疗工具声明', t.includes('不是医疗或心理治疗工具'));
     ok('包含核心设计承诺', t.includes('只有你确认过的行动才会创建成任务') && t.includes('没有强制打卡'));
   }
@@ -985,7 +1002,53 @@ async function main() {
     ok('显示测试生词与释义', t.includes(testVocabTerm) && t.includes('注意力'));
     ok('生词标明来源文章', t.includes('UI 自测 · 外刊阅读'));
     ok('有备注与删除入口', t.includes('写备注') && root.querySelectorAll('.vocab-card').length >= 1);
-    ok('没有 [object Object]', !t.includes('[object Object]'));
+    ok('★ 生词卡显示派生词', t.includes('派生词') && t.includes('attentive') && t.includes('专注的'));
+    ok('★ 生词卡显示衍生词', t.includes('衍生词') && t.includes('pay attention to') && t.includes('关注'));
+    ok('★ 生词卡显示例句', t.includes('例句') && t.includes('Attention helps you finish one thing at a time'));
+    ok('★ 生词卡显示牛津例句与来源',
+      t.includes('牛津词典例句') && t.includes('full attention') && t.includes('英文释义与例句：牛津词典'));
+    ok('★ 生词卡可以跳到牛津和欧路词典',
+      root.querySelectorAll('.vocab-links').length >= 1
+      && root.querySelectorAll('a').some((a) => String(a.getAttribute('href') || '').includes('oxfordlearnersdictionaries'))
+      && root.querySelectorAll('a').some((a) => String(a.getAttribute('href') || '').includes('dict.eudic.net')));
+    ok('新字段存进了生词记录',
+      testVocab.entry.derivatives.length === 1 && testVocab.entry.relatedWords.length === 1
+      && testVocab.entry.examples.length === 1 && testVocab.entry.dictionarySource === 'oxford');
+  }
+
+  console.log('\n【外刊阅读 · 选择题解析】');
+  {
+    const { parseQuizText } = await import(
+      pathToFileURL(path.join(PUBLIC, 'js', 'article-quiz.js')).href
+    );
+    const parsed = parseQuizText([
+      '１．The author mentions the study mainly to',
+      'Ａ．explain the cause',
+      'Ｂ．question a common belief',
+      'Ｃ．describe a new policy',
+      'Ｄ．compare two countries',
+      '答案：Ｂ',
+      '解析：转折之后才是重点。',
+      '',
+      '2. Which word means “fall sharply”?',
+      'A) rise',
+      'B) drop quickly',
+      'C) stay flat',
+      '答案: B',
+    ].join('\n'));
+    ok('★ 能识别编号题干与选项', parsed.questions.length === 2);
+    ok('★ 全角数字与全角选项也能识别',
+      parsed.questions[0].options.length === 4 && parsed.questions[0].answer === 'B');
+    ok('答案与解析一起进入题目',
+      parsed.questions[1].answer === 'B' && parsed.questions[0].explanation.includes('转折'));
+    let quizError = null;
+    try { parseQuizText('This is just a paragraph.'); } catch (err) { quizError = err; }
+    ok('★ 没有题目时明确报错，不生成空题',
+      Boolean(quizError) && /没有识别到选择题/.test(quizError.message));
+    let optionOnly = null;
+    try { parseQuizText('A. first\nB. second\n'); } catch (err) { optionOnly = err; }
+    ok('只有选项没有题干时说明原因',
+      Boolean(optionOnly) && /识别到了选项/.test(optionOnly.message));
   }
 
   console.log('\n【外刊阅读 · 阅读器】');
@@ -995,16 +1058,281 @@ async function main() {
     const t = root.allText();
     ok('显示文章标题与来源', t.includes('UI 自测 · 外刊阅读') && t.includes('UI 自测刊物'));
     ok('正文按段落渲染', root.querySelectorAll('.article-block').length >= 6);
-    ok('显示词汇 / 批注 / 文章问答三个面板', t.includes('词汇') && t.includes('批注 1') && t.includes('文章问答'));
+    ok('显示词汇 / 批注 / 文章问答 / 题目四个面板',
+      t.includes('词汇') && t.includes('批注 1') && t.includes('文章问答') && t.includes('题目'));
     ok('★ 已有高亮用 mark 渲染', root.querySelectorAll('.article-hl').length >= 1);
+    ok('★ 选区工具条提供四种高亮颜色', root.querySelectorAll('.article-color').length === 4);
+    const firstMark = root.querySelector('.article-hl');
+    ok('★ 已有批注用下划线渲染、不铺高亮底色',
+      Boolean(firstMark)
+      && firstMark.classList.contains('is-annotated')
+      && !firstMark.className.split(/\s+/).some((name) => name.startsWith('hl-')));
     ok('有字号调节与阅读进度', root.querySelectorAll('.article-font').length === 1 && t.includes('A+'));
     ok('默认面板提示点词或选句', t.includes('点一个词') && t.includes('双击句子'));
     ok('★ 明确标注是本地规则引擎，不伪造释义',
       t.includes('本地规则引擎') && t.includes('没有释义能力'));
     ok('★ 说明当前文章只作为本次阅读上下文', t.includes('不会写进长期 AI 记忆'));
+    const articleViewSrc = require('fs').readFileSync(path.join(PUBLIC, 'js', 'views', 'article.js'), 'utf8');
+    ok('★ 查词面板有派生词与衍生词分组',
+      articleViewSrc.includes("'派生词'") && articleViewSrc.includes("'衍生词'")
+      && articleViewSrc.includes('entry.derivatives') && articleViewSrc.includes('entry.relatedWords'));
+    const articleAiSrc = require('fs').readFileSync(path.join(PUBLIC, '..', 'server', 'article-ai.js'), 'utf8');
+    ok('查词提示词要求模型返回派生词和衍生词',
+      articleAiSrc.includes('"derivatives"') && articleAiSrc.includes('"relatedWords"'));
+    ok('★ 查词提示词要求例句另写、不照抄原文',
+      articleAiSrc.includes('不要照抄') && articleAiSrc.includes('常见用法')
+      && articleAiSrc.includes('copiedFromContext'));
+    ok('查词提示词要求 JSON 每个键都出现',
+      articleAiSrc.includes('每个键都必须出现') && articleAiSrc.includes('GAP_SYSTEM'));
+    ok('例句区标明不摘自这篇文章',
+      articleViewSrc.includes('例句 · 常见用法') && articleViewSrc.includes('不摘自这篇文章'));
+    ok('★ 查词面板显示牛津例句和词典跳转',
+      articleViewSrc.includes('牛津词典例句') && articleViewSrc.includes('在欧路词典查看')
+      && articleViewSrc.includes('dictionaryLinks'));
+
+    const { renderArticleParagraph } = await import(
+      pathToFileURL(path.join(PUBLIC, 'js', 'article-text.js')).href
+    );
+    const hlBlock = renderArticleParagraph(
+      { id: 'hl-test', kind: 'paragraph', text: 'Attention is a finite resource.' },
+      [{ id: 'hl-test-1', start: 0, end: 9, quote: 'Attention' }]
+    );
+    const hlMark = hlBlock.querySelector('.article-hl');
+    ok('★ 高亮单词不再拦截点击事件', Boolean(hlMark) && !(hlMark.listeners.click || []).length);
+    ok('高亮提示说明点击仍会查词', Boolean(hlMark) && hlMark.getAttribute('title').includes('查词'));
+    ok('查词卡保留批注入口',
+      articleViewSrc.includes('activeHighlightLine') && articleViewSrc.includes('highlightIdOf'));
+
+    const coloredBlock = renderArticleParagraph(
+      { id: 'hl-color', kind: 'paragraph', text: 'Attention is a finite resource.' },
+      [
+        { id: 'hl-blue', start: 0, end: 9, quote: 'Attention', color: 'blue' },
+        { id: 'hl-note', start: 14, end: 20, quote: 'finite', color: 'green', note: '有限的' },
+      ]
+    );
+    const coloredMarks = coloredBlock.querySelectorAll('.article-hl');
+    ok('★ 普通高亮按记录渲染不同颜色',
+      coloredMarks.length === 2
+      && coloredMarks[0].classList.contains('hl-blue')
+      && !coloredMarks[0].classList.contains('is-annotated'));
+    ok('★ 批注只渲染下划线，不再带高亮底色',
+      coloredMarks[1].classList.contains('is-annotated')
+      && !coloredMarks[1].classList.contains('hl-green')
+      && coloredMarks[1].getAttribute('title').includes('悬停'));
+    ok('★ 批注节点带上用于悬停显示的批注 id',
+      coloredMarks[1].dataset.noteId === 'hl-note');
+
+    const overlapBlock = renderArticleParagraph(
+      { id: 'hl-overlap', kind: 'paragraph', text: 'Attention is a finite resource.' },
+      [
+        { id: 'hl-old', start: 0, end: 9, color: 'yellow' },
+        { id: 'hl-new', start: 0, end: 9, color: 'purple', note: '重叠批注' },
+      ]
+    );
+    const overlapMark = overlapBlock.querySelector('.article-hl');
+    ok('★ 重叠高亮里有批注时整段只显示下划线',
+      overlapMark.dataset.highlightColor === 'purple'
+      && !overlapMark.classList.contains('hl-purple')
+      && overlapMark.classList.contains('is-annotated')
+      && overlapMark.dataset.noteId === 'hl-new');
+
+    const fallbackBlock = renderArticleParagraph(
+      { id: 'hl-fallback', kind: 'paragraph', text: 'Attention is a finite resource.' },
+      [{ id: 'hl-bad', start: 0, end: 9, color: 'neon' }]
+    );
+    ok('★ 未知颜色回退为黄色',
+      fallbackBlock.querySelector('.article-hl').classList.contains('hl-yellow'));
+
+    const notesTab = root.querySelectorAll('.article-rail-tab')
+      .find((button) => button.allText().startsWith('批注'));
+    if (notesTab) notesTab.fire('click');
+    const noteCard = root.querySelector('.note-card');
+    ok('★ 批注卡片用下划线标记，不再显示高亮色点',
+      Boolean(noteCard)
+      && noteCard.classList.contains('is-annotation')
+      && !noteCard.querySelector('.note-swatch')
+      && Boolean(noteCard.querySelector('.note-underline-mark'))
+      && noteCard.querySelector('.note-kind').classList.contains('has-note'));
+
+    const paragraphHost = root.querySelector('.article-text');
+    const annotatedMark = root.querySelectorAll('.article-hl')
+      .find((mark) => mark.classList.contains('is-annotated'));
+    const noteTip = root.querySelector('.article-note-tip');
+    ok('★ 阅读器带批注悬停浮层', Boolean(paragraphHost) && Boolean(annotatedMark) && Boolean(noteTip));
+    if (paragraphHost && annotatedMark) {
+      paragraphHost.fire('mouseover', { target: annotatedMark });
+      await new Promise((resolve) => setTimeout(resolve, 220));
+      ok('★ 鼠标悬停在批注词上会显示批注内容',
+        !noteTip.classList.contains('is-hidden') && noteTip.allText().includes('第一处批注'));
+      paragraphHost.fire('mouseout', { target: annotatedMark });
+      ok('移开后批注浮层收起', noteTip.classList.contains('is-hidden'));
+    }
+
+    const readingToggle = root.querySelector('.article-reading-toggle');
+    ok('★ 有独立的阅读模式开关', Boolean(readingToggle) && readingToggle.allText().includes('阅读模式'));
+    if (readingToggle) {
+      readingToggle.fire('click');
+      const shell = root.querySelector('.article-reader');
+      ok('★ 进入阅读模式会收起侧栏并切换按钮文案',
+        shell.classList.contains('is-reading-mode') && readingToggle.allText().includes('退出阅读模式'));
+      ok('★ 阅读模式下选词 / 查词 / 高亮 / 批注入口都被跳过',
+        articleViewSrc.includes('if (readingMode) return;')
+        && articleViewSrc.includes('if (readingMode) {'));
+      if (paragraphHost && annotatedMark) {
+        paragraphHost.fire('mouseover', { target: annotatedMark });
+        await new Promise((resolve) => setTimeout(resolve, 220));
+        ok('阅读模式里仍可悬停查看批注',
+          !noteTip.classList.contains('is-hidden') && noteTip.allText().includes('第一处批注'));
+        paragraphHost.fire('mouseout', { target: annotatedMark });
+      }
+      readingToggle.fire('click');
+      ok('可以退出阅读模式',
+        !root.querySelector('.article-reader').classList.contains('is-reading-mode')
+        && readingToggle.allText().includes('阅读模式'));
+    }
+    ok('★ 查词等待时会显示已经等了多少秒',
+      articleViewSrc.includes('lookupElapsedText') && articleViewSrc.includes('startLookupClock')
+      && articleViewSrc.includes('已等待'));
+    ok('★ 旧的查词请求晚回来不会覆盖新结果',
+      articleViewSrc.includes('seq !== lookupSeq') && articleViewSrc.includes('stopLookupClock'));
+    ok('★ 正文底部有已阅读完毕按钮',
+      t.includes('已阅读完毕') && Boolean(root.querySelector('.article-finish-btn')));
     ok('没有 [object Object]', !t.includes('[object Object]'));
     ok('阅读器返回清理函数', typeof cleanup === 'function');
     if (cleanup) cleanup();
+
+    const finishedAt = await api.setArticleFinished(testArticle.id, true);
+    ok('★ 接口能把整篇文章标记为已读', Boolean(finishedAt));
+    const doneView = await renderView('article', { id: testArticle.id }, all);
+    const doneText = doneView.root.allText();
+    ok('★ 重新打开显示已读完并可撤销',
+      doneText.includes('这篇已经读完了') && doneText.includes('撤销已读'));
+    if (doneView.cleanup) doneView.cleanup();
+
+    const doneShelf = await renderView('articles', {}, all);
+    const doneRow = doneShelf.root.querySelectorAll('.article-row')
+      .find((el) => el.allText().includes('UI 自测 · 外刊阅读'));
+    ok('★ 书架把这篇标为已读完',
+      Boolean(doneRow) && doneRow.querySelector('.article-row-pct').allText().includes('已读完'));
+    await api.setArticleFinished(testArticle.id, false);
+
+    const quizEmpty = await renderView('article', { id: testArticle.id }, all);
+    const emptyQuizTab = quizEmpty.root.querySelectorAll('.article-rail-tab')
+      .find((el) => el.allText().startsWith('题目'));
+    if (emptyQuizTab) emptyQuizTab.fire('click');
+    const emptyQuizText = quizEmpty.root.allText();
+    ok('★ 未导入时题目面板给出导入入口',
+      emptyQuizText.includes('还没有导入题目') && emptyQuizText.includes('导入选择题'));
+    ok('空状态说明本地解析、不发给模型',
+      emptyQuizText.includes('本地') && emptyQuizText.includes('不会把题目发给任何模型'));
+    if (quizEmpty.cleanup) quizEmpty.cleanup();
+
+    const quizSeed = await api.saveArticleQuiz(testArticle.id, [
+      {
+        stem: 'What does the passage value most?',
+        options: [
+          { key: 'A', text: 'Speed' },
+          { key: 'B', text: 'Attention' },
+          { key: 'C', text: 'Noise' },
+        ],
+        answer: 'B',
+        explanation: '文章把注意力放在速度之前。',
+      },
+      {
+        stem: 'Which habit is suggested?',
+        options: [
+          { key: 'A', text: 'Protect one unhurried hour' },
+          { key: 'B', text: 'Open everything first' },
+        ],
+      },
+    ]);
+    ok('★ 接口能保存选择题', quizSeed.questions.length === 2 && /^qz-/.test(quizSeed.questions[0].id));
+
+    const quizOpen = await renderView('article', { id: testArticle.id }, all);
+    const quizTab = quizOpen.root.querySelectorAll('.article-rail-tab')
+      .find((el) => el.allText().startsWith('题目'));
+    ok('★ 右栏出现题目标签与题目数量', Boolean(quizTab) && quizTab.allText().includes('题目 2'));
+    if (quizTab) quizTab.fire('click');
+    const quizText = quizOpen.root.allText();
+    ok('★ 题目面板显示题干、选项和进度',
+      quizText.includes('共 2 题') && quizText.includes('What does the passage value most?')
+      && quizText.includes('Attention') && quizText.includes('导入于'));
+    ok('★ 有答案的题目显示待选择，无答案的题目明确说明',
+      quizText.includes('待选择') && quizText.includes('这组题没有提供答案'));
+
+    const quizOptionA = quizOpen.root.querySelectorAll('.article-quiz-option')
+      .find((el) => el.allText().includes('Speed'));
+    ok('选项是真正的按钮', Boolean(quizOptionA) && quizOptionA.tagName === 'BUTTON');
+    if (quizOptionA) quizOptionA.fire('click');
+    const wrongOption = quizOpen.root.querySelectorAll('.article-quiz-option')
+      .find((el) => el.classList.contains('wrong'));
+    const answerOption = quizOpen.root.querySelectorAll('.article-quiz-option')
+      .find((el) => el.classList.contains('correct'));
+    ok('★ 选错时同时标出所选项与正确答案',
+      Boolean(wrongOption) && wrongOption.allText().includes('Speed')
+      && Boolean(answerOption) && answerOption.allText().includes('Attention'));
+    ok('选完后显示解析', quizOpen.root.allText().includes('文章把注意力放在速度之前'));
+
+    let persistedQuiz = '';
+    for (let i = 0; i < 40 && persistedQuiz !== 'A'; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const fresh = await api.getArticle(testArticle.id);
+      persistedQuiz = fresh.article.quiz.questions[0].selected;
+    }
+    ok('★ 选择会保存到服务端', persistedQuiz === 'A', persistedQuiz);
+
+    for (let i = 0; i < 40; i += 1) {
+      const options = quizOpen.root.querySelectorAll('.article-quiz-option');
+      if (options.length && options.every((option) => !option.disabled)) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const quizOptionB = quizOpen.root.querySelectorAll('.article-quiz-option')
+      .find((el) => el.allText().includes('Attention'));
+    if (quizOptionB) quizOptionB.fire('click');
+    ok('★ 选对后显示答对与正确标记',
+      quizOpen.root.allText().includes('答对')
+      && quizOpen.root.querySelectorAll('.article-quiz-status')
+        .some((el) => el.classList.contains('is-ok')));
+    ok('有重做本题入口', Boolean(quizOpen.root.querySelector('.article-quiz-card-actions')));
+
+    for (let i = 0; i < 40 && persistedQuiz !== 'B'; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const fresh = await api.getArticle(testArticle.id);
+      persistedQuiz = fresh.article.quiz.questions[0].selected;
+    }
+    ok('★ 改选也会保存到服务端', persistedQuiz === 'B', persistedQuiz);
+    if (quizOpen.cleanup) quizOpen.cleanup();
+    await api.clearArticleQuiz(testArticle.id);
+  }
+
+  console.log('\n【外刊阅读 · PDF 页眉清理】');
+  {
+    const { stripRepeatedPageHeaders } = await import(
+      pathToFileURL(path.join(PUBLIC, 'js', 'article-import.js')).href
+    );
+    const cleaned = stripRepeatedPageHeaders([
+      { text: '公众号：一直夫妇的日常 Serve the rich It is becoming even harder for poor students.' },
+      { text: '公众号：一直夫妇的日常 prestigious universities, Peking University and Tsinghua, are in Beijing.' },
+      { text: '公众号：一直夫妇的日常 pay for the training needed to compete.' },
+    ]);
+    ok('★ 去掉每页重复的公众号页眉',
+      cleaned.every((text) => !text.includes('公众号：一直夫妇的日常')));
+    ok('页眉清理保留正文开头',
+      cleaned[0].startsWith('Serve the rich') && cleaned[1].startsWith('prestigious'));
+
+    const standalone = stripRepeatedPageHeaders([
+      { text: 'The Economist\nFirst page body.' },
+      { text: 'The Economist\nSecond page body.' },
+    ]);
+    ok('独立成行的英文刊名页眉也会去掉',
+      standalone.every((text) => !text.startsWith('The Economist')));
+
+    const body = stripRepeatedPageHeaders([
+      { text: 'It is becoming harder for poor students.' },
+      { text: 'It is becoming difficult for rural students.' },
+    ]);
+    ok('共同的正文开头不会被误判为页眉',
+      body[0].startsWith('It is becoming') && body[1].startsWith('It is becoming'));
   }
 
   // ---------------------------------------------------------------- 路由

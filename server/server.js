@@ -1955,6 +1955,8 @@ async function handleArticles(req, res, seg, query) {
       percent: 0,
       lastReadAt: null,
     };
+    article.finishedAt = null;
+    articles.clearQuiz(article);
     await db.writeArticleContent(id, next);
     await db.put('articles', article);
     return sendJson(res, 200, { article: articles.articleDetail(article), paragraphs: next });
@@ -1966,6 +1968,39 @@ async function handleArticles(req, res, seg, query) {
     const progress = articles.applyProgress(article, paragraphs, body);
     await db.put('articles', article);
     return sendJson(res, 200, { progress });
+  }
+
+  if (seg.length === 4 && seg[3] === 'finish') {
+    if (method === 'POST') {
+      const finishedAt = articles.markFinished(article, true);
+      await db.put('articles', article);
+      return sendJson(res, 200, { finishedAt });
+    }
+    if (method === 'DELETE') {
+      const finishedAt = articles.markFinished(article, false);
+      await db.put('articles', article);
+      return sendJson(res, 200, { finishedAt });
+    }
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
+  }
+
+  if (seg.length === 4 && seg[3] === 'quiz') {
+    if (method === 'PATCH') {
+      const body = await readBody(req);
+      if (typeof body.questionId === 'string' && body.questionId) {
+        articles.setQuizAnswer(article, body.questionId, body.selected);
+      } else {
+        article.quiz = articles.buildQuiz(body);
+      }
+      await db.put('articles', article);
+      return sendJson(res, 200, { quiz: articles.quizView(article.quiz) });
+    }
+    if (method === 'DELETE') {
+      articles.clearQuiz(article);
+      await db.put('articles', article);
+      return sendJson(res, 200, { quiz: null });
+    }
+    throw Object.assign(new Error('不支持的方法'), { status: 405 });
   }
 
   if (seg.length === 4 && seg[3] === 'highlights') {

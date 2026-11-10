@@ -219,6 +219,68 @@ export default async function renderSettings(root, ctx) {
     h('p.tiny.muted.mb0', {}, `当前：${settings.hasApiKey ? '已配置 Key' : '还没有配置 Key'}。远程调用失败时会自动回退到本地规则引擎，并告诉你原因。`),
   ]);
 
+  // ---------------------------------------------------------------- 词典来源
+
+  const oxfordAppId = h('input', {
+    type: 'text',
+    value: settings.oxfordAppId || '',
+    placeholder: 'Oxford App ID',
+  });
+  const oxfordAppKey = h('input', {
+    type: 'password',
+    placeholder: settings.hasOxfordKey ? '已经保存（留空则不修改）' : 'Oxford App Key',
+  });
+
+  const dictionaryCard = h('div.card', {}, [
+    h('p.small.muted.mt0', {}, [
+      '配置牛津词典 API 后，查词会优先采用牛津的英文释义和官方例句；中文解释、搭配和语境含义仍由当前 AI 引擎补充。',
+      '没有配置也能正常查词，只是英文解释来自模型。',
+    ]),
+    h('p.small.muted', {}, [
+      'App ID 和 App Key 需要到 ',
+      h('a', {
+        href: 'https://developer.oxforddictionaries.com/',
+        target: '_blank',
+        rel: 'noopener',
+      }, 'Oxford Dictionaries'),
+      ' 申请，免费额度大约每月 3000 次。',
+    ]),
+    h('div.notice.quiet', {}, [
+      h('strong', {}, '只会发送选中的词：'),
+      ' 启用后，查词只把选中的单词或短语发给牛津接口，不会发送文章段落、批注或生词本里的其他内容。',
+    ]),
+    h('label.field', {}, [
+      h('span.label-text', {}, '牛津 App ID（Oxford App ID）'),
+      h('span.label-hint', {}, '和 App Key 一起保存在本机的 data/settings.json，不会出现在页面源码里。'),
+      oxfordAppId,
+    ]),
+    h('label.field', {}, [
+      h('span.label-text', {}, '牛津 App Key（Oxford App Key）'),
+      oxfordAppKey,
+    ]),
+    h('div.btn-row', {}, [
+      h('button.btn.primary', {
+        onclick: async () => {
+          const next = await patch({
+            oxfordAppId: oxfordAppId.value,
+            oxfordAppKey: oxfordAppKey.value,
+          }, '牛津词典设置已保存。');
+          if (next) oxfordAppKey.value = '';
+        },
+      }, '保存词典设置'),
+      settings.hasOxfordKey
+        ? h('button.btn.danger', {
+            onclick: async () => {
+              const sure = await confirmDialog('清掉牛津词典凭据？', '清掉后会回到模型释义，其他设置不受影响。', '清掉');
+              if (!sure) return;
+              await patch({ clearOxfordKey: true, oxfordAppId: '' }, '已清掉牛津词典凭据。');
+            },
+          }, '清掉凭据')
+        : null,
+    ]),
+    h('p.tiny.muted.mb0', {}, `当前：${settings.hasOxfordKey ? '已配置牛津 App Key' : '还没有配置牛津词典'}。欧路词典没有公开的词典内容接口，这里不抓取它的释义；查词面板和生词本会提供跳到欧路网页版的链接。`),
+  ]);
+
   // ---------------------------------------------------------------- 数据
 
   const stats = state.stats || {};
@@ -233,6 +295,11 @@ export default async function renderSettings(root, ctx) {
       h('div.section', {}, [
         h('div.section-head', {}, [h('h2', {}, 'AI 引擎')]),
         h('div.card', {}, [providerSeg, ollamaFields, realFields]),
+      ]),
+
+      h('div.section', {}, [
+        h('div.section-head', {}, [h('h2', {}, '词典来源（可选）')]),
+        dictionaryCard,
       ]),
 
       h('div.section', {}, [
