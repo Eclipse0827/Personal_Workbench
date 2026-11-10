@@ -299,6 +299,9 @@ function defaultSettings() {
     modelProviders: [],
     /** 全局默认用的模型，格式 providerId/modelId，或 'mock' */
     defaultModelRef: modelConfig.MOCK_REF,
+    /** 牛津词典 API（可选，只用于补充官方释义和例句） */
+    oxfordAppId: '',
+    oxfordAppKey: '',
   };
 }
 
@@ -341,6 +344,8 @@ async function getPublicSettings() {
     modelProviders: modelConfig.publicProviders(s.modelProviders),
     defaultModelRef: s.defaultModelRef,
     modelOptions: modelConfig.flatOptions(s),
+    oxfordAppId: s.oxfordAppId || '',
+    hasOxfordKey: Boolean(s.oxfordAppKey),
   };
 }
 
@@ -400,6 +405,11 @@ async function saveSettings(patch) {
   // 让旧字段跟默认模型对齐。切到规则引擎时不清 Key，用户切回来还在。
   modelConfig.syncLegacy(next);
 
+  if (typeof patch.oxfordAppId === 'string') next.oxfordAppId = patch.oxfordAppId.trim();
+  if (typeof patch.oxfordAppKey === 'string' && patch.oxfordAppKey.trim() !== '') {
+    next.oxfordAppKey = patch.oxfordAppKey.trim();
+  }
+  if (patch.clearOxfordKey === true) next.oxfordAppKey = '';
   // 只保留约定字段，避免设置文件被塞进预期外的东西
   const clean = {
     aiProvider: next.aiProvider,
@@ -412,6 +422,8 @@ async function saveSettings(patch) {
     agentEnabled: next.agentEnabled !== false,
     modelProviders: next.modelProviders,
     defaultModelRef: next.defaultModelRef,
+    oxfordAppId: next.oxfordAppId,
+    oxfordAppKey: next.oxfordAppKey,
   };
   await atomicWrite(SETTINGS_FILE, JSON.stringify(clean, null, 2));
   return getPublicSettings();

@@ -45,11 +45,18 @@ function isRetryable(status) {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function fetchWithTimeout(url, options, timeoutMs) {
+/**
+ * 超时覆盖到响应体读完。
+ * 有些兼容接口会先回响应头，再慢慢生成内容；只给 fetch() 计时的话，
+ * 响应头一到计时器就被清掉，页面会一直转圈。
+ */
+async function fetchTextWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    const text = await res.text();
+    return { res, text };
   } finally {
     clearTimeout(timer);
   }
@@ -59,7 +66,10 @@ async function fetchWithTimeout(url, options, timeoutMs) {
  * 发一次完整的（非流式）对话请求。
  * 返回 { text, provider, model }；失败抛异常，由调用方决定是否回退本地整理。
  */
-async function complete({ settings, system, user, messages, temperature = 0.35, maxTokens = 1600, timeoutMs = 90000 }) {
+async function complete({
+  settings, system, user, messages, temperature = 0.35, maxTokens = 1600,
+  timeoutMs = 90000, disableReasoning = false,
+}) {
   const provider = settings.aiProvider;
   const chatMessages = messages || [
     system ? { role: 'system', content: system } : null,
@@ -71,29 +81,44 @@ async function complete({ settings, system, user, messages, temperature = 0.35, 
     const base = String(settings.baseUrl || '').replace(/\/+$/, '');
     if (!base) throw new Error('还没有配置远程模型接口地址');
 
+    const payload = {
+      model: settings.model || 'gpt-4o-mini',
+      temperature,
+      max_tokens: maxTokens,
+      messages: chatMessages,
+    };
+    if (disableReasoning) payload.reasoning_effort = 'none';
+
+    let attempt = 0;
     let res;
-    try {
-      res = await fetchWithTimeout(`${base}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.apiKey}` },
-        body: JSON.stringify({
-          model: settings.model || 'gpt-4o-mini',
-          temperature,
-          max_tokens: maxTokens,
-          messages: chatMessages,
-        }),
-      }, timeoutMs);
-    } catch (err) {
-      throw new Error(err.name === 'AbortError'
-        ? `远程模型超过 ${Math.round(timeoutMs / 1000)} 秒没有返回`
-        : `连不上远程模型：${err.message}`);
+    let bodyText = '';
+    while (true) {
+      try {
+        ({ res, text: bodyText } = await fetchTextWithTimeout(`${base}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.apiKey}` },
+          body: JSON.stringify(payload),
+        }, timeoutMs));
+      } catch (err) {
+        throw new Error(err.name === 'AbortError'
+          ? `远程模型超过 ${Math.round(timeoutMs / 1000)} 秒没有返回`
+          : `连不上远程模型：${err.message}`);
+      }
+
+      if (res.ok) break;
+
+      // 有些兼容接口不认识 reasoning_effort，去掉它再试一次。
+      if (attempt === 0 && payload.reasoning_effort && [400, 422].includes(res.status)
+        && /reasoning|unknown|unsupported|invalid/i.test(bodyText)) {
+        delete payload.reasoning_effort;
+        attempt += 1;
+        continue;
+      }
+      throw new Error(`模型接口返回 ${res.status}${bodyText ? `：${bodyText.slice(0, 180)}` : ''}`);
     }
 
-    if (!res.ok) {
-      const body = cleanErrorBody(await res.text().catch(() => ''));
-      throw new Error(`模型接口返回 ${res.status}${body ? `：${body.slice(0, 180)}` : ''}`);
-    }
-    const data = await res.json();
+    let data;
+    try { data = JSON.parse(bodyText); } catch { throw new Error('模型接口返回了无法解析的内容'); }
     const text = stripThink(data?.choices?.[0]?.message?.content || '');
     if (!text) throw new Error('模型返回了空内容');
     return { text, provider: 'real', model: data.model || settings.model };
@@ -119,7 +144,7 @@ async function complete({ settings, system, user, messages, temperature = 0.35, 
     };
 
     async function post(payload) {
-      return fetchWithTimeout(`${base}/api/chat`, {
+      return fetchTextWithTimeout(`${base}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -127,11 +152,12 @@ async function complete({ settings, system, user, messages, temperature = 0.35, 
     }
 
     let res;
+    let bodyText = '';
     try {
-      res = await post(body);
+      ({ res, text: bodyText } = await post(body));
       if (res.status === 400) {
         const { think, ...withoutThink } = body;
-        res = await post(withoutThink);
+        ({ res, text: bodyText } = await post(withoutThink));
       }
     } catch (err) {
       throw new Error(err.name === 'AbortError'
@@ -140,10 +166,10 @@ async function complete({ settings, system, user, messages, temperature = 0.35, 
     }
 
     if (!res.ok) {
-      const detail = await res.text().catch(() => '');
-      throw new Error(`Ollama 返回 ${res.status}${detail ? `：${detail.slice(0, 180)}` : ''}`);
+      throw new Error(`Ollama 返回 ${res.status}${bodyText ? `：${bodyText.slice(0, 180)}` : ''}`);
     }
-    const data = await res.json();
+    let data;
+    try { data = JSON.parse(bodyText); } catch { throw new Error('Ollama 返回了无法解析的内容'); }
     const text = stripThink(data?.message?.content || '');
     if (!text) throw new Error('Ollama 返回了空内容');
     return { text, provider: 'ollama', model: data.model || model };

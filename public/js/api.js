@@ -208,6 +208,13 @@ export const api = {
     req('PUT', `/api/articles/${id}/content`, payload).then((d) => d),
   saveArticleProgress: (id, payload) =>
     req('PATCH', `/api/articles/${id}/progress`, payload).then((d) => d.progress),
+  setArticleFinished: (id, finished) =>
+    req(finished ? 'POST' : 'DELETE', `/api/articles/${id}/finish`).then((d) => d.finishedAt),
+  saveArticleQuiz: (id, questions) =>
+    req('PATCH', `/api/articles/${id}/quiz`, { questions }).then((d) => d.quiz),
+  saveQuizAnswer: (id, questionId, selected) =>
+    req('PATCH', `/api/articles/${id}/quiz`, { questionId, selected }).then((d) => d.quiz),
+  clearArticleQuiz: (id) => req('DELETE', `/api/articles/${id}/quiz`).then(() => null),
   addHighlight: (id, payload) => req('POST', `/api/articles/${id}/highlights`, payload).then((d) => d.highlight),
   patchHighlight: (id, highlightId, payload) =>
     req('PATCH', `/api/articles/${id}/highlights/${highlightId}`, payload).then((d) => d.highlight),

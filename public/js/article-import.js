@@ -10,9 +10,52 @@ import { extractPdf } from './pdf-import.js';
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024;
 const TEXT_FILE = /\.(txt|md|markdown|text)$/i;
 const MAX_CHARS = 300000;
+const MIN_MARGIN_CHARS = 8;
+const MAX_MARGIN_CHARS = 120;
 
 function failure(message, code) {
   return Object.assign(new Error(message), { code });
+}
+
+/** 页眉通常出现在每一页开头：刊物名、公众号、页码或网址。 */
+function looksLikePageMargin(prefix) {
+  if (/\n$/.test(prefix)) return true;
+  if (/(公众号|微信|来源|作者|日期|第\s*\d+\s*页|page\s*\d+|https?:\/\/|www\.|©)/i.test(prefix)) return true;
+  if (/[：｜|]/.test(prefix)) return true;
+  const words = prefix.trim().split(/\s+/);
+  return words.length >= 2 && words.filter((word) => /^[A-Z]/.test(word)).length >= 2;
+}
+
+/**
+ * 去掉每一页都重复的开头（PDF 页眉）。
+ * 只处理所有非空页面都共有的前缀，避免误删正文里偶然重复的句子开头。
+ * 返回清理后的逐页文字，顺序不变。
+ */
+export function stripRepeatedPageHeaders(pages) {
+  const texts = (pages || []).map((page) => String((page && page.text) || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n?/g, '\n')
+    .trim());
+  const nonEmpty = texts.filter(Boolean);
+  if (nonEmpty.length < 2) return texts;
+
+  let prefix = nonEmpty[0];
+  for (const text of nonEmpty.slice(1)) {
+    let i = 0;
+    while (i < prefix.length && i < text.length && prefix[i] === text[i]) i += 1;
+    prefix = prefix.slice(0, i);
+    if (prefix.length < MIN_MARGIN_CHARS) return texts;
+  }
+  prefix = prefix.slice(0, MAX_MARGIN_CHARS);
+
+  // 公共前缀可能停在一个词中间，退回到最后一个空白处再判断。
+  if (!/[\s：:｜|·•\-–—]$/.test(prefix)) {
+    const cut = Math.max(prefix.lastIndexOf(' '), prefix.lastIndexOf('\t'), prefix.lastIndexOf('　'));
+    prefix = cut >= MIN_MARGIN_CHARS ? prefix.slice(0, cut + 1) : '';
+  }
+  if (prefix.length < MIN_MARGIN_CHARS || !looksLikePageMargin(prefix)) return texts;
+
+  return texts.map((text) => (text.startsWith(prefix) ? text.slice(prefix.length).trim() : text));
 }
 
 /** 读取一个文件，返回 { text, format, fileName, title, warnings }。不写任何数据。 */
@@ -26,8 +69,7 @@ export async function prepareArticleFile(file, { onProgress } = {}) {
 
   if (/\.pdf$/i.test(fileName)) {
     const extracted = await extractPdf(file, { onProgress });
-    const text = extracted.pages
-      .map((page) => page.text)
+    const text = stripRepeatedPageHeaders(extracted.pages)
       .filter(Boolean)
       .join('\n\n')
       .trim();

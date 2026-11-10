@@ -9,6 +9,12 @@ import { h } from './ui.js';
 
 const WORD_CHAR = /[A-Za-z'’-]/;
 
+export const HIGHLIGHT_COLORS = ['yellow', 'green', 'blue', 'purple'];
+
+export function highlightColor(value) {
+  return HIGHLIGHT_COLORS.includes(value) ? value : 'yellow';
+}
+
 function clampRange(start, end, length) {
   const a = Math.max(0, Math.min(length, start));
   const b = Math.max(a, Math.min(length, end));
@@ -37,15 +43,24 @@ export function splitHighlightSegments(text, highlights = []) {
   for (let i = 0; i < sorted.length - 1; i += 1) {
     const start = sorted[i];
     const end = sorted[i + 1];
-    const ids = valid
-      .filter((hl) => hl.start <= start && hl.end >= end)
-      .map((hl) => hl.id);
-    out.push({ start, end, text: source.slice(start, end), ids });
+    const matches = valid.filter((hl) => hl.start <= start && hl.end >= end);
+    const top = matches[matches.length - 1];
+    const noted = matches.filter((hl) => typeof hl.note === 'string' && hl.note.trim());
+    const noteMatch = noted[noted.length - 1];
+    out.push({
+      start,
+      end,
+      text: source.slice(start, end),
+      ids: matches.map((hl) => hl.id),
+      color: highlightColor(top && top.color),
+      annotated: Boolean(noteMatch),
+      noteId: noteMatch ? noteMatch.id : '',
+    });
   }
   return out;
 }
 
-export function renderArticleParagraph(paragraph, highlights = [], { onHighlightClick } = {}) {
+export function renderArticleParagraph(paragraph, highlights = []) {
   const tag = paragraph.kind === 'heading' ? 'h2'
     : paragraph.kind === 'quote' ? 'blockquote'
       : paragraph.kind === 'code' ? 'pre'
@@ -61,13 +76,18 @@ export function renderArticleParagraph(paragraph, highlights = [], { onHighlight
       el.appendChild(document.createTextNode(segment.text));
       continue;
     }
-    const mark = h('mark.article-hl', {
-      dataset: { highlightIds: segment.ids.join(',') },
-      title: '查看批注',
-      onclick: (e) => {
-        e.stopPropagation();
-        if (onHighlightClick) onHighlightClick(segment.ids[0]);
+    const mark = h(segment.annotated
+      ? 'mark.article-hl.is-annotated'
+      : `mark.article-hl.hl-${segment.color}`, {
+      dataset: {
+        highlightIds: segment.ids.join(','),
+        highlightColor: segment.color,
+        annotated: segment.annotated ? 'true' : 'false',
+        noteId: segment.noteId || '',
       },
+      title: segment.annotated
+        ? '这条批注只会显示赭色下划线；鼠标悬停可以查看批注内容'
+        : '已高亮，点击查词；选中文字可以写批注',
     }, segment.text);
     el.appendChild(mark);
   }

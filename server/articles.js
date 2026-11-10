@@ -16,6 +16,10 @@ const MAX_HIGHLIGHT_CHARS = 2000;
 const MAX_HIGHLIGHT_NOTE = 1000;
 const MAX_CHAT_MESSAGES = 200;
 const MAX_CHAT_CHARS = 4000;
+const MAX_QUIZ_QUESTIONS = 50;
+const MAX_QUIZ_OPTIONS = 8;
+const HIGHLIGHT_COLORS = ['yellow', 'green', 'blue', 'purple'];
+const DEFAULT_HIGHLIGHT_COLOR = 'yellow';
 const FONT_MIN = 16;
 const FONT_MAX = 26;
 const DEFAULT_FONT = 19;
@@ -222,6 +226,10 @@ function newArticleRecord({
       percent: 0,
       lastReadAt: null,
     },
+    /** 用户自己点「已阅读完毕」的时间；null 表示还没标记 */
+    finishedAt: null,
+    /** 从粘贴的文本里解析出来的选择题；null 表示还没导入 */
+    quiz: null,
     reader: { fontSize: DEFAULT_FONT },
     highlights: [],
     createdAt: now,
@@ -251,6 +259,7 @@ function articleSummary(article) {
     excerpt: article.excerpt,
     tags: article.tags || [],
     progress: article.progress || null,
+    finishedAt: article.finishedAt || null,
     reader: article.reader || { fontSize: DEFAULT_FONT },
     createdAt: article.createdAt,
     updatedAt: article.updatedAt,
@@ -260,7 +269,10 @@ function articleSummary(article) {
 function articleDetail(article) {
   return {
     ...articleSummary(article),
-    highlights: Array.isArray(article.highlights) ? article.highlights : [],
+    highlights: Array.isArray(article.highlights)
+      ? article.highlights.map((hl) => ({ ...hl, color: normalizeHighlightColor(hl.color) }))
+      : [],
+    quiz: quizView(article.quiz),
   };
 }
 
@@ -300,22 +312,125 @@ function applyProgress(article, paragraphs, input = {}) {
   return article.progress;
 }
 
+function markFinished(article, finished = true) {
+  article.finishedAt = finished ? db.nowIso() : null;
+  return article.finishedAt;
+}
+
+// ---------------------------------------------------------------- 选择题
+
+function normalizeQuizKey(value) {
+  const key = String(value || '').trim().toUpperCase();
+  return /^[A-H]$/.test(key) ? key : '';
+}
+
+function quizView(quiz) {
+  if (!quiz || !Array.isArray(quiz.questions) || !quiz.questions.length) return null;
+  return {
+    importedAt: quiz.importedAt || null,
+    updatedAt: quiz.updatedAt || quiz.importedAt || null,
+    questions: quiz.questions.map((q) => ({
+      id: q.id,
+      stem: q.stem,
+      options: (q.options || []).map((o) => ({ key: o.key, text: o.text })),
+      answer: q.answer || '',
+      explanation: q.explanation || '',
+      selected: q.selected || '',
+    })),
+  };
+}
+
+function buildQuiz(input = {}) {
+  const rawQuestions = Array.isArray(input.questions) ? input.questions : [];
+  if (!rawQuestions.length) throw bad('没有可以保存的题目');
+  if (rawQuestions.length > MAX_QUIZ_QUESTIONS) {
+    throw bad(`一次最多保存 ${MAX_QUIZ_QUESTIONS} 道题`);
+  }
+  const questions = [];
+  for (const raw of rawQuestions) {
+    if (!raw || typeof raw !== 'object') continue;
+    const stem = str(raw.stem, 2000);
+    if (!stem) throw bad('有一道题缺少题干');
+    const seen = new Set();
+    const options = [];
+    for (const option of Array.isArray(raw.options) ? raw.options : []) {
+      if (!option || typeof option !== 'object') continue;
+      const key = normalizeQuizKey(option.key);
+      const text = str(option.text, 1000);
+      if (!key || !text || seen.has(key)) continue;
+      seen.add(key);
+      options.push({ key, text });
+      if (options.length >= MAX_QUIZ_OPTIONS) break;
+    }
+    if (options.length < 2) throw bad(`「${stem.slice(0, 20)}」至少要有两个选项`);
+    const answer = normalizeQuizKey(raw.answer);
+    const selected = normalizeQuizKey(raw.selected);
+    questions.push({
+      id: /^qz-[\w-]+$/.test(String(raw.id || '')) ? String(raw.id) : db.newId('qz'),
+      stem,
+      options,
+      answer: seen.has(answer) ? answer : '',
+      explanation: str(raw.explanation, 4000),
+      selected: seen.has(selected) ? selected : '',
+    });
+  }
+  if (!questions.length) throw bad('没有可以保存的题目');
+  const now = db.nowIso();
+  return { questions, importedAt: now, updatedAt: now };
+}
+
+function setQuizAnswer(article, questionId, selected) {
+  const quiz = article.quiz;
+  if (!quiz || !Array.isArray(quiz.questions) || !quiz.questions.length) {
+    throw Object.assign(new Error('这篇文章还没有导入题目'), { status: 404 });
+  }
+  const question = quiz.questions.find((q) => q.id === questionId);
+  if (!question) throw Object.assign(new Error('这道题已经不在了'), { status: 404 });
+  const key = normalizeQuizKey(selected);
+  if (key && !(question.options || []).some((o) => o.key === key)) {
+    throw bad('这个选项不存在');
+  }
+  question.selected = key;
+  quiz.updatedAt = db.nowIso();
+  return quiz;
+}
+
+function clearQuiz(article) {
+  article.quiz = null;
+  return article;
+}
+
 function ensureHighlightBudget(article, exceptId = null) {
   const count = (article.highlights || []).filter((h) => h.id !== exceptId).length;
   if (count >= MAX_HIGHLIGHTS) throw bad(`每篇文章最多 ${MAX_HIGHLIGHTS} 条高亮`);
 }
 
+function normalizeHighlightColor(value) {
+  return HIGHLIGHT_COLORS.includes(value) ? value : DEFAULT_HIGHLIGHT_COLOR;
+}
+
+function readHighlightColor(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (!HIGHLIGHT_COLORS.includes(value)) throw bad('高亮颜色不正确');
+  return value;
+}
+
 function buildHighlight(article, paragraphs, input = {}, existing = null) {
-  const paragraphId = str(input.paragraphId, 64);
+  const paragraphId = str(input.paragraphId, 64) || (existing ? existing.paragraphId : '');
   const paragraph = paragraphs.find((p) => p.id === paragraphId);
   if (!paragraph) throw bad('找不到要高亮的段落');
-  const start = int(input.start);
-  const end = int(input.end);
+  const start = input.start === undefined && existing ? existing.start : int(input.start);
+  const end = input.end === undefined && existing ? existing.end : int(input.end);
   if (start === null || end === null || start < 0 || start >= end || end > paragraph.text.length) {
     throw bad('高亮范围不正确');
   }
   if (end - start > MAX_HIGHLIGHT_CHARS) throw bad('一次高亮的文字太长了');
-  const note = typeof input.note === 'string' ? input.note.trim().slice(0, MAX_HIGHLIGHT_NOTE) : '';
+  const note = input.note === undefined && existing
+    ? existing.note
+    : (typeof input.note === 'string' ? input.note.trim().slice(0, MAX_HIGHLIGHT_NOTE) : '');
+  const color = input.color === undefined && existing
+    ? normalizeHighlightColor(existing.color)
+    : (readHighlightColor(input.color) || DEFAULT_HIGHLIGHT_COLOR);
   const now = db.nowIso();
   if (existing) {
     existing.paragraphId = paragraphId;
@@ -323,6 +438,7 @@ function buildHighlight(article, paragraphs, input = {}, existing = null) {
     existing.end = end;
     existing.quote = paragraph.text.slice(start, end);
     existing.note = note;
+    existing.color = color;
     existing.updatedAt = now;
     return existing;
   }
@@ -334,6 +450,7 @@ function buildHighlight(article, paragraphs, input = {}, existing = null) {
     end,
     quote: paragraph.text.slice(start, end),
     note,
+    color,
     createdAt: now,
     updatedAt: now,
   };
@@ -424,6 +541,40 @@ function exampleList(value) {
     .slice(0, 6);
 }
 
+function wordEntryList(value, maxItems, maxWordLength) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (typeof item === 'string') {
+        const word = item.trim().slice(0, maxWordLength);
+        return word ? { word, partOfSpeech: '', meaningZh: '' } : null;
+      }
+      if (!item || typeof item !== 'object') return null;
+      const word = str(item.word, maxWordLength);
+      if (!word) return null;
+      return {
+        word,
+        partOfSpeech: str(item.partOfSpeech, 60),
+        meaningZh: str(item.meaningZh, 300),
+      };
+    })
+    .filter(Boolean)
+    .slice(0, maxItems);
+}
+
+function oxfordBlock(value) {
+  if (!value || typeof value !== 'object') return null;
+  const definitions = stringList(value.definitions, 4, 600);
+  const examples = exampleList(value.examples);
+  if (!definitions.length && !examples.length) return null;
+  return {
+    label: '牛津词典',
+    partOfSpeech: str(value.partOfSpeech, 80),
+    definitions,
+    examples,
+  };
+}
+
 function newVocabularyRecord({ article, contextText, selectionText, kind, entry }) {
   const term = str(entry && entry.term, 120) || str(selectionText, 120);
   const normalized = normalizeTerm(term);
@@ -439,11 +590,15 @@ function newVocabularyRecord({ article, contextText, selectionText, kind, entry 
     definitionEn: str(entry && entry.definitionEn, 800),
     definitionZh: str(entry && entry.definitionZh, 800),
     collocations: stringList(entry && entry.collocations, 8, 180),
+    derivatives: wordEntryList(entry && entry.derivatives, 8, 80),
+    relatedWords: wordEntryList(entry && entry.relatedWords, 8, 120),
     examples: exampleList(entry && entry.examples),
     contextMeaning: str(entry && entry.contextMeaning, 1000),
     contextText: str(contextText, 800),
     articleId: article.id,
     articleTitle: article.title,
+    dictionarySource: entry && entry.dictionarySource === 'oxford' ? 'oxford' : '',
+    oxford: oxfordBlock(entry && entry.oxford),
     entryProvider: str(entry && entry.provider, 20) || 'unknown',
     entryModel: str(entry && entry.model, 120),
     entryGeneratedAt: now,
@@ -461,6 +616,22 @@ function mergeVocabulary(existing, incoming) {
   existing.articleTitle = incoming.articleTitle;
   if (!existing.definitionZh && incoming.definitionZh) existing.definitionZh = incoming.definitionZh;
   if (!existing.contextMeaning && incoming.contextMeaning) existing.contextMeaning = incoming.contextMeaning;
+  if (!(existing.examples || []).length && (incoming.examples || []).length) {
+    existing.examples = incoming.examples;
+  }
+  if (!(existing.derivatives || []).length && (incoming.derivatives || []).length) {
+    existing.derivatives = incoming.derivatives;
+  }
+  if (!(existing.relatedWords || []).length && (incoming.relatedWords || []).length) {
+    existing.relatedWords = incoming.relatedWords;
+  }
+  if (incoming.dictionarySource === 'oxford' && incoming.oxford) {
+    existing.dictionarySource = 'oxford';
+    existing.oxford = incoming.oxford;
+    if (incoming.definitionEn) existing.definitionEn = incoming.definitionEn;
+  } else if (!existing.dictionarySource && incoming.dictionarySource) {
+    existing.dictionarySource = incoming.dictionarySource;
+  }
   existing.updatedAt = db.nowIso();
   return existing;
 }
@@ -496,6 +667,10 @@ module.exports = {
   MAX_PARAGRAPHS,
   MAX_HIGHLIGHTS,
   MAX_CHAT_MESSAGES,
+  MAX_QUIZ_QUESTIONS,
+  MAX_QUIZ_OPTIONS,
+  HIGHLIGHT_COLORS,
+  DEFAULT_HIGHLIGHT_COLOR,
   FONT_MIN,
   FONT_MAX,
   DEFAULT_FONT,
@@ -508,6 +683,11 @@ module.exports = {
   articleDetail,
   patchArticle,
   applyProgress,
+  markFinished,
+  quizView,
+  buildQuiz,
+  setQuizAnswer,
+  clearQuiz,
   buildHighlight,
   findHighlight,
   normalizeSelection,

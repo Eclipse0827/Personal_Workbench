@@ -54,9 +54,7 @@ dist-electron/
 .doc-preview/
 .pip-cache/
 .demo-data/
-.tmp-test-data/
-.tmp-ui-data/
-.tmp-selftest-data/
+.tmp-*/
 *.log
 
 # 本机工具留下的配置与索引，和作品代码无关
@@ -71,3 +69,7 @@ NUL
 
 # 一次性调试脚本
 scripts/debug-chat.js
+
+# 平板 APK 的编译产物与本地签名（来自上游）
+android-tablet/build/
+android-tablet/tablet-release.jks
