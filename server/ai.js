@@ -30,10 +30,31 @@ const { newProposal, todayStr, dateOnly } = require('./models');
 const tools = require('./tools');
 const llm = require('./llm');
 const profile = require('./profile');
+const { detectCrisis, crisisReply } = require('./safety');
 
 // 本地 Ollama 的整轮超时。以前这里直接用了一个从未定义的常量，
 // 结果每次走到 Ollama 改写都会抛 ReferenceError，然后被当成「连不上」回退。
 const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS) || 20000;
+
+/**
+ * 危机输入的回复。形状和 mockRespond 的返回保持一致，
+ * 但内容全部由代码给出：不给方案、不引用学习数据、不调用模型。
+ */
+function crisisResult() {
+  return {
+    reply: crisisReply(),
+    problemCard: null,
+    proposal: null,
+    provider: 'mock',
+    intent: 'pour',
+    asked: [],
+    pendingIntent: null,
+    contextUsed: false,
+    contextFactText: '',
+    contextFactLines: [],
+    meta: { safety: true },
+  };
+}
 
 // ================================================================ 意图与领域
 
@@ -735,6 +756,9 @@ function buildMockReply({
  *   · 从历史消息里累积已经得到的科目信息
  */
 function mockRespond(conversation, userText, options = {}) {
+  // 危机输入先接住：不拆任务，也不假装成普通倾诉
+  if (detectCrisis(userText)) return crisisResult();
+
   const context = options.context || null;
   const dataRequested = wantsLearningData(userText);
   const history = conversation.messages || [];
@@ -1545,6 +1569,9 @@ async function ollamaReply({ settings, userText, draft, context }) {
  * 任何外部引擎失败都回退到规则引擎，并如实把失败原因带回去（PRD 6.3）。
  */
 async function respond({ conversation, userText, settings, context = null }) {
+  // 危机输入在「选引擎」之前就接住：远程和 Ollama 都拿不到这句话
+  if (detectCrisis(userText)) return crisisResult();
+
   // ---- 远程 OpenAI 兼容接口：模型负责全部内容
   // 学习记录要不要一起发出去，由设置里的 shareContext 显式决定（默认关）。
   if (settings.aiProvider === 'real' && settings.apiKey) {
@@ -1744,6 +1771,12 @@ async function agentRespondStream({ conversation, userText, settings, context = 
 
 /** 统一的流式入口：非远程引擎直接一次性吐出规则引擎的回复 */
 async function respondStream({ conversation, userText, settings, context = null, onEvent = () => {}, shouldStop = null }) {
+  // 危机输入在选引擎之前就接住：流式这条路也不能绕过安全边界
+  if (detectCrisis(userText)) {
+    const out = crisisResult();
+    onEvent({ type: 'partial', text: out.reply });
+    return out;
+  }
   if (settings.aiProvider === 'real' && settings.apiKey && settings.agentEnabled !== false) {
     let emitted = false;
     const wrapped = (e) => {
