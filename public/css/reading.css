@@ -80,8 +80,7 @@
 .article-import-host:empty { display: none; }
 .article-import-host { margin: 0 0 20px; }
 .card.article-import-progress,
-.card.article-import-error { border-left: 3px solid var(--sage); padding: 18px 20px; }
-.card.article-import-error { border-left-color: var(--warm); }
+.card.article-import-error { padding: 18px 20px; }
 .article-import-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .article-import-head h3 { margin: 2px 0 0; font-size: 17px; }
 .article-import-pct { font-size: 19px; color: var(--sage-2); font-variant-numeric: tabular-nums; }
@@ -139,7 +138,7 @@
 .vocab-word-group { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
 .vocab-context {
   margin-top: 10px; padding: 10px 13px; background: var(--surface-2);
-  border-left: 2px solid var(--gold);
+  border: 1px solid var(--line);
 }
 .vocab-context p { margin: 3px 0 0; font-size: 13px; line-height: 1.72; color: var(--ink-2); }
 .vocab-note { margin: 10px 0 0; font-size: 12.5px; color: var(--ink-2); }
@@ -487,7 +486,7 @@ body.reading-article .scrim { display: none !important; }
 .lookup-example-zh { margin: 2px 0 0; font-size: 12px; color: var(--ink-3); line-height: 1.65; }
 .lookup-context {
   margin-top: 17px; padding: 12px 14px;
-  background: var(--gold-soft); border-left: 2px solid var(--gold);
+  background: var(--gold-soft); border: 1px solid rgba(138, 106, 47, .3);
 }
 .lookup-context p { margin: 3px 0 0; font-size: 13.5px; line-height: 1.75; }
 .lookup-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 18px; }
@@ -526,7 +525,7 @@ body.reading-article .scrim { display: none !important; }
 .note-card.is-annotation .note-quote { border-left-color: rgba(139, 74, 47, .8); }
 .note-quote {
   margin: 0; padding-left: 10px;
-  border-left: 2px solid rgba(var(--hl-rgb, 138, 106, 47), .85);
+  border: 1px solid rgba(var(--hl-rgb, 138, 106, 47), .35);
   font-size: 12.5px; line-height: 1.65; color: var(--ink-2); font-style: italic;
 }
 .note-text { margin: 7px 0 0; font-size: 12.5px; line-height: 1.7; }
@@ -680,7 +679,7 @@ body.reading-article .scrim { display: none !important; }
 
 .article-quote {
   margin: 0 0 12px; padding: 8px 12px;
-  border-left: 2px solid var(--gold); background: var(--surface-2);
+  border: 1px solid var(--line); background: var(--surface-2);
   font-size: 13px; line-height: 1.7; color: var(--ink-2);
 }
 

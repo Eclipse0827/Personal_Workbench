@@ -12,10 +12,11 @@ import { h, modal, toast, toastError, TASK_STATUS_LABEL, TASK_PRIORITY_LABEL, to
  * @param {object} opts
  *   task     要编辑的任务（不传＝新增）
  *   plans    可关联的计划列表
- *   defaults 新增时的默认值（例如 { scheduledDate: today, planId }）
+ *   projects 可关联的学习项目列表
+ *   defaults 新增时的默认值（例如 { scheduledDate: today, planId, projectId }）
  *   onSaved  保存成功回调
  */
-export function openTaskForm({ task = null, plans = [], defaults = {}, onSaved } = {}) {
+export function openTaskForm({ task = null, plans = [], projects = [], defaults = {}, onSaved } = {}) {
   const isEdit = Boolean(task);
   const t = task || {};
 
@@ -35,6 +36,14 @@ export function openTaskForm({ task = null, plans = [], defaults = {}, onSaved }
       h('option', {
         value: p.id,
         selected: (t.planId || defaults.planId) === p.id,
+      }, p.title)),
+  ]);
+  const project = h('select', {}, [
+    h('option', { value: '', selected: !(t.projectId || defaults.projectId) }, '不关联学习项目'),
+    ...projects.map((p) =>
+      h('option', {
+        value: p.id,
+        selected: (t.projectId || defaults.projectId) === p.id,
       }, p.title)),
   ]);
 
@@ -64,13 +73,22 @@ export function openTaskForm({ task = null, plans = [], defaults = {}, onSaved }
       h('label.field', {}, [h('span.label-text', {}, '优先级'), priority]),
       h('label.field', {}, [h('span.label-text', {}, '状态'), status]),
     ]),
-    plans.length
-      ? h('label.field.mb0', {}, [
-          h('span.label-text', {}, '属于哪个计划'),
-          h('span.label-hint', {}, '可选。'),
-          plan,
-        ])
-      : h('p.tiny.muted.mb0', {}, '还没有学习计划。需要的话可以在「待办与计划」里先建一个。'),
+    h('div.split', {}, [
+      plans.length
+        ? h('label.field.mb0', {}, [
+            h('span.label-text', {}, '属于哪个计划'),
+            h('span.label-hint', {}, '可选。'),
+            plan,
+          ])
+        : h('p.tiny.muted.mb0', {}, '还没有学习计划。需要的话可以在「待办与计划」里先建一个。'),
+      projects.length
+        ? h('label.field.mb0', {}, [
+            h('span.label-text', {}, '属于哪个学习项目'),
+            h('span.label-hint', {}, '可选。归到项目里，在项目页就能看到这条。'),
+            project,
+          ])
+        : h('p.tiny.muted.mb0', {}, '还没有学习项目，可以先在「学习项目」里建一个。'),
+    ]),
   ]);
 
   modal({
@@ -88,6 +106,7 @@ export function openTaskForm({ task = null, plans = [], defaults = {}, onSaved }
             return false;
           }
           try {
+            const nextProjectId = project.value || null;
             const payload = {
               title: title.value,
               description: description.value,
@@ -96,6 +115,9 @@ export function openTaskForm({ task = null, plans = [], defaults = {}, onSaved }
               priority: priority.value,
               status: status.value,
               planId: plan.value || null,
+              projectId: nextProjectId,
+              // 换了项目就把旧课程关联清掉，免得课程挂在别的项目下面
+              courseId: nextProjectId === (t.projectId || null) ? (t.courseId || null) : null,
             };
             if (isEdit) await api.patchTask(t.id, payload);
             else await api.createTask(payload);

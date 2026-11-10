@@ -420,14 +420,13 @@ input::placeholder, textarea::placeholder { color: var(--ink-4); }
 .notice {
   padding: 13px 16px; border-radius: 2px;
   border: 1px solid var(--line);
-  border-left: 3px solid var(--accent);
   font-size: 12.5px; line-height: 1.75;
   background: var(--surface-2); color: var(--ink-2);
   margin-bottom: 18px;
 }
-.notice.warm { background: var(--warm-soft); border-color: #ddc5ae; border-left-color: var(--warm); color: #7c442b; }
-.notice.alert { background: var(--alert-soft); border-color: #ddc3bb; border-left-color: var(--alert); color: var(--alert); }
-.notice.quiet { background: transparent; color: var(--ink-2); border-color: var(--line); border-left-color: var(--line-2); }
+.notice.warm { background: var(--warm-soft); border-color: #ddc5ae; color: #7c442b; }
+.notice.alert { background: var(--alert-soft); border-color: #ddc3bb; color: var(--alert); }
+.notice.quiet { background: transparent; color: var(--ink-2); border-color: var(--line); }
 
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 

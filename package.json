@@ -3,11 +3,24 @@
   "version": "2.0.0",
   "private": true,
   "description": "缓一缓 · 个人学术工作台 —— 安排学习任务、管理长期计划；思绪混乱时自然地聊一聊，确认之后把有用的部分变成待办。",
+  "author": "HuanYiHuan",
+  "main": "desktop/main.js",
   "scripts": {
     "start": "node server/server.js",
     "open": "node server/server.js --open",
+    "desktop": "electron .",
+    "desktop:smoke": "node scripts/desktop-smoke.js",
+    "desktop:pack": "electron-builder --win nsis --config electron-builder.yml && electron-builder --win portable --config electron-builder.yml",
+    "two": "node scripts/start-two.js",
+    "mobile:www": "node scripts/build-mobile-www.js",
+    "mobile:sync": "node scripts/build-android.js --sync-only",
+    "mobile:apk": "node scripts/build-android.js",
+    "mobile:open": "cd mobile && npx cap open android",
+    "mobile:serve": "node server/server.js --host 0.0.0.0",
+    "icons": "node scripts/make-pwa-icons.js",
     "float": "node desktop/launch.js",
-    "test": "node server/selftest.js && node server/uitest.js",
+    "test": "node server/agent-selftest.js && node server/selftest.js && node server/uitest.js",
+    "test:agent": "node server/agent-selftest.js",
     "test:api": "node server/selftest.js",
     "test:ui": "node server/uitest.js"
   },
@@ -15,6 +28,7 @@
     "node": ">=18"
   },
   "devDependencies": {
-    "electron": "^45.2.1"
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0"
   }
 }

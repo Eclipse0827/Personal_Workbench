@@ -8,7 +8,7 @@ import {
   h, toast, toastError, confirmDialog, taskRow, emptyState, pageHead,
   fmtShort, truncate, PLAN_STATUS_LABEL,
 } from '../ui.js';
-import { state, planById } from '../state.js';
+import { state, planById, projectById } from '../state.js';
 import { openTaskForm, openPlanForm } from './task-form.js';
 
 export default async function renderPlanDetail(root, ctx) {
@@ -36,8 +36,10 @@ export default async function renderPlanDetail(root, ctx) {
   }
 
   const rowFor = (task) => taskRow(task, {
+    planName: null,
+    projectName: task.projectId ? (projectById(task.projectId) || {}).title : null,
     onStatus: (s) => setStatus(task, s),
-    onEdit: () => openTaskForm({ task, plans: state.plans, onSaved: () => ctx.rerender() }),
+    onEdit: () => openTaskForm({ task, plans: state.plans, projects: state.projects, onSaved: () => ctx.rerender() }),
     onDelete: async () => {
       const ok = await confirmDialog('删掉这个任务？', `「${task.title}」会被删除。`, '删掉');
       if (!ok) return;
@@ -54,7 +56,7 @@ export default async function renderPlanDetail(root, ctx) {
         actions: [
           h('button.btn', { onclick: () => openPlanForm({ plan, onSaved: () => ctx.rerender() }) }, '编辑计划'),
           h('button.btn.primary', {
-            onclick: () => openTaskForm({ plans: state.plans, defaults: { planId: plan.id }, onSaved: () => ctx.rerender() }),
+            onclick: () => openTaskForm({ plans: state.plans, projects: state.projects, defaults: { planId: plan.id }, onSaved: () => ctx.rerender() }),
           }, '＋ 加任务'),
         ],
       }),
@@ -96,7 +98,7 @@ export default async function renderPlanDetail(root, ctx) {
             title: '这个计划下还没有任务',
             hint: '可以从待办里挑几个关进来，也可以让 AI 拆几条，创建时选这个计划。',
             actionLabel: '给它加第一个任务',
-            onAction: () => openTaskForm({ plans: state.plans, defaults: { planId: plan.id }, onSaved: () => ctx.rerender() }),
+            onAction: () => openTaskForm({ plans: state.plans, projects: state.projects, defaults: { planId: plan.id }, onSaved: () => ctx.rerender() }),
           }),
 
       h('div.notice.quiet.mt3', {}, '删除这个计划不会删掉它下面的任务，只会解除关联 —— 那些任务仍然在「未完成」里。'),

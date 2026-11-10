@@ -27,6 +27,34 @@
 
 const { dissect, detectPatterns } = require('./analyzer');
 const { newProposal, todayStr, dateOnly } = require('./models');
+const tools = require('./tools');
+const llm = require('./llm');
+const profile = require('./profile');
+const { detectCrisis, crisisReply } = require('./safety');
+
+// 本地 Ollama 的整轮超时。以前这里直接用了一个从未定义的常量，
+// 结果每次走到 Ollama 改写都会抛 ReferenceError，然后被当成「连不上」回退。
+const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS) || 20000;
+
+/**
+ * 危机输入的回复。形状和 mockRespond 的返回保持一致，
+ * 但内容全部由代码给出：不给方案、不引用学习数据、不调用模型。
+ */
+function crisisResult() {
+  return {
+    reply: crisisReply(),
+    problemCard: null,
+    proposal: null,
+    provider: 'mock',
+    intent: 'pour',
+    asked: [],
+    pendingIntent: null,
+    contextUsed: false,
+    contextFactText: '',
+    contextFactLines: [],
+    meta: { safety: true },
+  };
+}
 
 // ================================================================ 意图与领域
 
@@ -728,6 +756,9 @@ function buildMockReply({
  *   · 从历史消息里累积已经得到的科目信息
  */
 function mockRespond(conversation, userText, options = {}) {
+  // 危机输入先接住：不拆任务，也不假装成普通倾诉
+  if (detectCrisis(userText)) return crisisResult();
+
   const context = options.context || null;
   const dataRequested = wantsLearningData(userText);
   const history = conversation.messages || [];
@@ -933,52 +964,52 @@ function safeJson(text) {
   return null;
 }
 
-async function realRespond(conversation, userText, settings) {
-  const base = (settings.baseUrl || '').replace(/\/+$/, '');
-  if (!base) throw new Error('未配置接口地址');
-  if (!settings.apiKey) throw new Error('未配置 API Key');
+// ---------------------------------------------------------------- 模型调用
 
-  const history = (conversation.messages || []).slice(-14).map((m) => ({
+/**
+ * 带进模型的历史。
+ *
+ * 注意：调用前服务端已经把这句用户输入 push 进 conversation.messages 了（为了切页面不丢），
+ * 所以这里要把最后那条挑出去 —— 否则模型会看到同一个问题连着出现两次，
+ * 容易重复回答，也白烧 token。
+ */
+function historyOf(conversation, currentText = null, limit = 20) {
+  let msgs = conversation.messages || [];
+  if (currentText != null && msgs.length) {
+    const last = msgs[msgs.length - 1];
+    if (last.role === 'user' && String(last.content || '').trim() === String(currentText).trim()) {
+      msgs = msgs.slice(0, -1);
+    }
+  }
+  return msgs.slice(-limit).map((m) => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
     content: m.content,
   }));
+}
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 45000);
-  let res;
-  try {
-    res = await fetch(`${base}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.apiKey}` },
-      body: JSON.stringify({
-        model: settings.model || 'gpt-4o-mini',
-        temperature: 0.4,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          ...history,
-          {
-            role: 'user',
-            content: `${userText}\n\n（今天是 ${todayStr()}。请只输出规定的 JSON。）`,
-          },
-        ],
-      }),
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+/** 把模型叫一次，只负责拿到字符串；底层走 llm.js（统一超时、错误与 think 剥离） */
+async function callChat(settings, messages, { timeoutMs = 90000, temperature = 0.4 } = {}) {
+  const out = await llm.complete({ settings, messages, temperature, timeoutMs });
+  return out.text;
+}
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`模型接口返回 ${res.status}${body ? `：${body.slice(0, 160)}` : ''}`);
-  }
-
-  const payload = await res.json();
-  const content = payload?.choices?.[0]?.message?.content || '';
+/**
+ * 解析模型输出。
+ * 刻意宽容：不是 JSON 就当一段普通回复，不因为格式问题把整轮对话打掉。
+ */
+function parseAssistant(content, conversation) {
   const parsed = safeJson(content);
-  if (!parsed) throw new Error('模型返回的内容不是有效 JSON');
+  if (!parsed) {
+    const text = String(content || '').trim();
+    return {
+      reply: text || '我在。你想从哪里说起都可以。',
+      problemCard: null,
+      proposal: null,
+      actions: [],
+      raw: true,
+    };
+  }
 
-  // 校验并规整模型输出，避免坏结构直接进数据库
   const problemCard = parsed.problemCard && typeof parsed.problemCard === 'object'
     ? {
         summary: String(parsed.problemCard.summary || ''),
@@ -998,7 +1029,7 @@ async function realRespond(conversation, userText, settings) {
   let proposal = null;
   if (parsed.proposal && Array.isArray(parsed.proposal.actions) && parsed.proposal.actions.length) {
     proposal = newProposal({
-      conversationId: conversation.id,
+      conversationId: (conversation && conversation.id) || 'conv-agent',
       title: parsed.proposal.title,
       summary: parsed.proposal.summary,
       actions: parsed.proposal.actions.slice(0, 6).map((a, i) => ({
@@ -1011,10 +1042,59 @@ async function realRespond(conversation, userText, settings) {
     });
   }
 
+  const actions = Array.isArray(parsed.actions)
+    ? parsed.actions
+        .filter((a) => a && typeof a.tool === 'string')
+        .slice(0, 4)
+        .map((a) => ({ tool: a.tool, args: a.args && typeof a.args === 'object' ? a.args : {} }))
+    : [];
+
   return {
     reply: String(parsed.reply || '').trim() || '我在。你想从哪里说起都可以。',
     problemCard,
     proposal,
+    actions,
+    raw: false,
+  };
+}
+
+/** 学习记录要不要发给远程模型，由设置里的开关决定；没开就一个字都不带 */
+function contextBlockFor(context, userText, settings) {
+  if (!settings || settings.shareContext !== true || !context) return '';
+  let note = '';
+  try {
+    note = buildContextNote(context, { userText, intent: 'analyze' });
+  } catch {
+    note = '';
+  }
+  if (!note) return '';
+  return `\n\n系统里的记录（只作为事实依据，不要照抄，也不要因为记录里没有就说用户没做过）：\n${note}`;
+}
+
+/** 长期记忆：只有在「让它看到学习记录」打开时才一起发出去 */
+async function profileBlock(settings) {
+  if (!settings || settings.shareContext !== true) return '';
+  try {
+    const text = await profile.asText();
+    if (!text) return '';
+    return '\n\n【关于这个人的长期记录】\n' + text + '\n（以前记下的，跨对话仍然成立；不要重复问，也不要当成新发现）';
+  } catch { return ''; }
+}
+async function realRespond(conversation, userText, settings, context = null) {
+  const extra = await profileBlock(settings);
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    ...historyOf(conversation, userText),
+    {
+      role: 'user',
+      content: `${userText}${contextBlockFor(context, userText, settings)}${extra}\n\n（今天是 ${todayStr()}。请只输出规定的 JSON。）`,
+    },
+  ];
+
+  const content = await callChat(settings, messages);
+  const out = parseAssistant(content, conversation);
+  return {
+    ...out,
     provider: 'real',
     intent: detectIntent(userText, conversation.messages),
     asked: [],
@@ -1022,24 +1102,133 @@ async function realRespond(conversation, userText, settings) {
   };
 }
 
-// ================================================================ 本地 Ollama
+// ---------------------------------------------------------------- 智能体循环
+
+const AGENT_PROTOCOL = `
+
+【你可以调用工具】
+${tools.TOOL_SPEC}
+
+需要真实数据、或者需要替用户把事情做掉时，不要凭空猜，改成输出这样的 JSON：
+{"reply":"我先查一下","actions":[{"tool":"list_tasks","args":{"scope":"today"}}]}
+系统会执行 actions 并把结果回给你，你可以接着决定下一步，最多连续 3 轮。
+拿到需要的信息之后，再按原来的格式给出最终回复 —— 最终回复里不要再带 actions。
+
+规矩：
+- 只读工具随时可查；create_project / add_course / create_tasks / update_task 只在用户明确要求你动手时使用。
+- 用户说「加进去」「帮我建」「安排上」这类话，就是明确要求，可以直接建，不用再让他确认一遍。
+- 用户提到某个学习项目或课程时：先用 list_projects 查到 id，再把 projectId（必要时 courseId）传给 create_tasks，这样任务才会归到那个项目下。
+- 建之前先看一眼有没有同名的，别重复建。
+- 只有工具真正执行成功，才能说「已经建好 / 已经读到」。工具表里没有的能力（比如改设置、删数据）不许声称做了；做不到就直说做不到，并给出你能做的替代动作。
+- 你自己查到的事实才可以说；没查到就说没查到。`;
 
 /**
- * Ollama 通道的分工（这个选择很重要，写在这里留给以后的自己看）：
+ * 工具结果怎么回灌给模型。
  *
- *   规则引擎  →  问题梳理卡、行动方案、行动条目、待确认事项、要不要问关键问题
- *   Ollama    →  只负责把「回复」这句话说得自然一点
+ * 以前是 JSON.stringify(整个数组).slice(0, 4000) —— 从中间硬切，
+ * 括号和引号会被切掉，模型拿到的是残缺 JSON，容易误读，
+ * 而 read_textbook 一次就能顶到上限。
  *
- * 为什么不让小模型生成结构化内容：
- *   实测本机 1.5B 模型在 format:json 下会把键名写错（"needQuestion:"），
- *   输出也会被截断；更要紧的是它不遵守 PRD 那几条硬规则
- *   （不擅自给「还没定」的科目排任务、不重复问同一个问题、倾诉时不推方案）。
- *   把它限制在「措辞」这一层，既用上了本地模型，又不会破坏已经测过的行为。
+ * 现在改成一条一条列，每条单独限长，超了明说超了，
+ * 结构始终是完整的句子，不是半截 JSON。
  */
+/** 用户主动中止时抛这个，上层凭 stopped 标记区分「停止」和「出错」 */
+function stoppedError() {
+  const err = new Error('已停止生成');
+  err.stopped = true;
+  return err;
+}
 
-const OLLAMA_TIMEOUT_MS = 120000;
+function formatToolResults(results, perItem = 3000, total = 7000) {
+  const clip = (s, n) => {
+    const str = String(s == null ? '' : s);
+    if (str.length <= n) return str;
+    return `${str.slice(0, n)}……（后面还有 ${str.length - n} 字没显示，需要细节就缩小范围再查一次）`;
+  };
+  const parts = results.map((r) => {
+    const head = `【${r.tool || '?'}】${r.ok ? '成功' : '失败'}：${r.summary || ''}`;
+    let body = '';
+    try { body = JSON.stringify(r.data == null ? {} : r.data); } catch { body = String(r.data); }
+    return `${head}\n数据：${clip(body, perItem)}`;
+  });
+  return clip(parts.join('\n\n'), total);
+}
+/** 工具痕迹要带回「这一下到底建了几条待办」，界面才好明确告诉用户已经直接建好了 */
+function toolTrace(r) {
+  return {
+    tool: r.tool,
+    ok: r.ok,
+    summary: r.summary,
+    createdCount: r.ok && r.tool === 'create_tasks' && r.data && Array.isArray(r.data.created)
+      ? r.data.created.length
+      : 0,
+  };
+}
 
-/** 列出本机 Ollama 的模型。连不上就返回 online:false，不抛异常。 */
+/**
+ * 工具调用循环。callModel 可注入，方便测试时不真的打模型。
+ */
+async function agentLoop({ settings, messages, conversation, maxRounds = 3, callModel = callChat }) {
+  const started = Date.now();
+  const trace = [];
+
+  for (let round = 1; round <= maxRounds; round += 1) {
+    const content = await callModel(settings, messages);
+    const out = parseAssistant(content, conversation);
+
+    if (!out.actions || !out.actions.length) {
+      return {
+        ...out,
+        provider: 'real',
+        asked: [],
+        hint: null,
+        meta: { rounds: round, tools: trace, durationMs: Date.now() - started },
+      };
+    }
+
+    const results = await tools.execute(out.actions, { conversationId: conversation && conversation.id });
+    trace.push(...results.map(toolTrace));
+
+    messages.push({ role: 'assistant', content });
+    messages.push({
+      role: 'user',
+      content: `工具执行结果：\n${formatToolResults(results)}\n\n信息够了就给出最终回复（不要带 actions）；还不够就继续调用。`,
+    });
+  }
+
+  // 到上限了：不再给工具，逼它收尾
+  messages.push({ role: 'user', content: '已经到调用上限。请直接给出最终回复，不要再调用工具。' });
+  const content = await callModel(settings, messages);
+  const out = parseAssistant(content, conversation);
+  return {
+    ...out,
+    actions: [],
+    provider: 'real',
+    asked: [],
+    hint: null,
+    meta: { rounds: maxRounds + 1, tools: trace, durationMs: Date.now() - started, capped: true },
+  };
+}
+
+async function agentRespond(conversation, userText, settings, context = null) {
+  const extra = await profileBlock(settings);
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT + AGENT_PROTOCOL },
+    ...historyOf(conversation, userText),
+    {
+      role: 'user',
+      content: `${userText}${contextBlockFor(context, userText, settings)}${extra}\n\n（今天是 ${todayStr()}。需要工具就输出 actions；否则只输出规定的 JSON。）`,
+    },
+  ];
+
+  const out = await agentLoop({ settings, messages, conversation });
+  return {
+    ...out,
+    intent: detectIntent(userText, conversation.messages),
+    actions: out.meta && out.meta.tools && out.meta.tools.length ? out.meta.tools : null,
+  };
+}
+
 async function listOllamaModels(baseUrl = 'http://127.0.0.1:11434') {
   const base = String(baseUrl || '').replace(/\/+$/, '');
   if (!base) return { online: false, models: [], error: '没有配置 Ollama 地址' };
@@ -1380,11 +1569,19 @@ async function ollamaReply({ settings, userText, draft, context }) {
  * 任何外部引擎失败都回退到规则引擎，并如实把失败原因带回去（PRD 6.3）。
  */
 async function respond({ conversation, userText, settings, context = null }) {
+  // 危机输入在「选引擎」之前就接住：远程和 Ollama 都拿不到这句话
+  if (detectCrisis(userText)) return crisisResult();
+
   // ---- 远程 OpenAI 兼容接口：模型负责全部内容
-  // 阶段 2A 不把学习上下文发给远程接口；选择数据不等于同意外发。
+  // 学习记录要不要一起发出去，由设置里的 shareContext 显式决定（默认关）。
   if (settings.aiProvider === 'real' && settings.apiKey) {
     try {
-      return await realRespond(conversation, userText, settings);
+      // 默认走带工具的智能体循环；agentEnabled=false 时退回单次问答
+      if (settings.agentEnabled === false) {
+        return await realRespond(conversation, userText, settings, context);
+      }
+      const out = await agentRespond(conversation, userText, settings, context);
+      return out;
     } catch (err) {
       const fallback = mockRespond(conversation, userText, { context });
       return {
@@ -1417,6 +1614,196 @@ async function respond({ conversation, userText, settings, context = null }) {
   return mockRespond(conversation, userText, { context });
 }
 
+// ---------------------------------------------------------------- 流式
+
+/**
+ * 从半截 JSON 里抠出 "reply" 当前的值。
+ * 模型是边生成边解析的，所以可能停在任意位置：没闭合引号就取到哪算哪。
+ */
+function partialReply(raw) {
+  const key = String(raw || '').indexOf('"reply"');
+  if (key < 0) return '';
+  let i = raw.indexOf(':', key);
+  if (i < 0) return '';
+  i += 1;
+  while (i < raw.length && /\s/.test(raw[i])) i += 1;
+  if (raw[i] !== '"') return '';
+  i += 1;
+  let out = '';
+  while (i < raw.length) {
+    const c = raw[i];
+    if (c === '\\') {
+      const n = raw[i + 1];
+      if (n === undefined) break;
+      if (n === 'n') out += '\n';
+      else if (n === 't') out += '\t';
+      else if (n === 'r') out += '';
+      else if (n === 'u') {
+        const hex = raw.slice(i + 2, i + 6);
+        if (hex.length < 4) break;
+        const code = parseInt(hex, 16);
+        if (Number.isFinite(code)) out += String.fromCharCode(code);
+        i += 4;
+      } else out += n;
+      i += 2;
+      continue;
+    }
+    if (c === '"') break;
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+const STREAM_PROTOCOL = `
+
+【输出格式（流式）】
+第一个字段必须是 kind：
+- 需要调用工具时输入 {"kind":"tool","actions":[...]}
+- 给出最终回答时输入 {"kind":"answer","reply":"给用户看的话","problemCard":...,"proposal":...}
+kind 之后才写别的内容，这样界面上才能边生成边显示。
+`;
+
+/**
+ * 带工具循环的流式回答。
+ * onEvent 会收到：{type:'status'} / {type:'partial',text} / {type:'tool',summary}
+ */
+async function agentRespondStream({ conversation, userText, settings, context = null, onEvent = () => {}, shouldStop = null }) {
+  const extra = await profileBlock(settings);
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT + AGENT_PROTOCOL + STREAM_PROTOCOL },
+    ...historyOf(conversation, userText),
+    {
+      role: 'user',
+      content: `${userText}${contextBlockFor(context, userText, settings)}${extra}\n\n（今天是 ${todayStr()}。需要工具就输出 kind=tool；否则输出 kind=answer。）`,
+    },
+  ];
+
+  const started = Date.now();
+  const trace = [];
+  const maxRounds = 3;
+
+  for (let round = 1; round <= maxRounds; round += 1) {
+    // 用户点了停止、或者关了页面：这一轮就别再打模型了
+    if (shouldStop && shouldStop()) throw stoppedError();
+    let acc = '';
+    let kind = '';
+    let emitted = false;
+    let announced = false;
+
+    const streamed = await llm.completeStream({
+      settings,
+      messages,
+      temperature: 0.4,
+      onDelta: (piece) => {
+        acc += piece;
+        if (!kind) {
+          if (/"kind"\s*:\s*"tool"/.test(acc)) kind = 'tool';
+          else if (/"kind"\s*:\s*"answer"/.test(acc)) kind = 'answer';
+        }
+        if (kind === 'answer') {
+          const r = partialReply(acc);
+          if (r) {
+            emitted = true;
+            onEvent({ type: 'partial', text: r });
+          }
+        } else if (kind === 'tool' && !announced) {
+          announced = true;
+          onEvent({ type: 'status', text: '正在查…' });
+        }
+      },
+    });
+    const text = streamed.text;
+
+    const out = parseAssistant(text, conversation);
+
+    if (!out.actions || !out.actions.length) {
+      // 停下来之后不要保存：半截答案比没有答案更让人困惑
+      if (shouldStop && shouldStop()) throw stoppedError();
+      if (!emitted) onEvent({ type: 'partial', text: out.reply });
+      return {
+        ...out,
+        provider: 'real',
+        asked: [],
+        hint: null,
+        // 流式路径也要把工具痕迹落到消息上，否则「它做过什么」永远不显示
+        actions: trace.length ? trace : null,
+        meta: { rounds: round, tools: trace, durationMs: Date.now() - started },
+      };
+    }
+
+    const results = await tools.execute(out.actions, { conversationId: conversation && conversation.id });
+    for (const r of results) {
+      trace.push(toolTrace(r));
+      onEvent({ type: 'tool', tool: r.tool, ok: r.ok, summary: r.summary, createdCount: toolTrace(r).createdCount });
+    }
+
+    messages.push({ role: 'assistant', content: text });
+    messages.push({
+      role: 'user',
+      content: `工具执行结果：\n${formatToolResults(results)}\n\n信息够了就输出 kind=answer；还不够就继续 kind=tool。`,
+    });
+  }
+
+  if (shouldStop && shouldStop()) throw stoppedError();
+  messages.push({ role: 'user', content: '已经到调用上限。请直接输出 kind=answer，不要再调用工具。' });
+  let acc = '';
+  const cappedText = (await llm.completeStream({
+    settings,
+    messages,
+    temperature: 0.4,
+    onDelta: (piece) => {
+      acc += piece;
+      const r = partialReply(acc);
+      if (r) onEvent({ type: 'partial', text: r });
+    },
+  })).text;
+  const out = parseAssistant(cappedText, conversation);
+  return {
+    ...out,
+    actions: trace.length ? trace : null,
+    provider: 'real',
+    asked: [],
+    hint: null,
+    meta: { rounds: maxRounds + 1, tools: trace, durationMs: Date.now() - started, capped: true },
+  };
+}
+
+/** 统一的流式入口：非远程引擎直接一次性吐出规则引擎的回复 */
+async function respondStream({ conversation, userText, settings, context = null, onEvent = () => {}, shouldStop = null }) {
+  // 危机输入在选引擎之前就接住：流式这条路也不能绕过安全边界
+  if (detectCrisis(userText)) {
+    const out = crisisResult();
+    onEvent({ type: 'partial', text: out.reply });
+    return out;
+  }
+  if (settings.aiProvider === 'real' && settings.apiKey && settings.agentEnabled !== false) {
+    let emitted = false;
+    const wrapped = (e) => {
+      if (e && e.type === 'partial' && e.text) emitted = true;
+      onEvent(e);
+    };
+    try {
+      return await agentRespondStream({ conversation, userText, settings, context, onEvent: wrapped, shouldStop });
+    } catch (err) {
+      // 用户自己点的停止：不要把结果换个就地重来，也不要回退到规则引擎
+      if (err && err.stopped) throw err;
+      const reason = String((err && err.message) || err).replace(/\s+/g, " ").slice(0, 160);
+      // 已经吐了一半：不要换个答案重来，把错误如实交给界面
+      if (emitted) throw new Error(reason);
+      const fallback = mockRespond(conversation, userText, { context });
+      onEvent({ type: 'partial', text: fallback.reply });
+      return {
+        ...fallback,
+        warning: `远程模型这次没接通，已用本地规则引擎回复。原因：${reason}`,
+      };
+    }
+  }
+  const out = await respond({ conversation, userText, settings, context });
+  onEvent({ type: 'partial', text: out.reply });
+  return out;
+}
+
 module.exports = {
   respond,
   mockRespond,
@@ -1436,4 +1823,13 @@ module.exports = {
   checkFactCoverage,
   extractFactTokens,
   MODULE_DEFS,
+  agentRespond,
+  agentLoop,
+  parseAssistant,
+  callChat,
+  respondStream,
+  agentRespondStream,
+  partialReply,
+  historyOf,
+  formatToolResults,
 };

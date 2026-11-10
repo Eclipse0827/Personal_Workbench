@@ -5,11 +5,12 @@
 
 import { api } from '../api.js';
 import {
-  h, toast, toastError, confirmDialog, emptyState, pageHead,
+  h, toast, toastError, confirmDialog, taskRow, emptyState, pageHead,
   fmtRelative, fmtDateTime, COURSE_PLATFORM_LABEL,
 } from '../ui.js';
-import { projectById } from '../state.js';
+import { state, projectById, planById } from '../state.js';
 import { openProjectForm, openCourseForm } from './project-form.js';
+import { openTaskForm } from './task-form.js';
 
 export default async function renderProjectDetail(root, ctx) {
   const project = projectById(ctx.args.id);
@@ -186,6 +187,35 @@ export default async function renderProjectDetail(root, ctx) {
     ]);
   }
 
+  // 归到这个项目下的待办：AI 建的、手动选的，都在这里能看见
+  const relatedTasks = (state.tasks || []).filter((t) => t.projectId === project.id);
+  const relatedSorted = [
+    ...relatedTasks.filter((t) => t.status !== 'done'),
+    ...relatedTasks.filter((t) => t.status === 'done'),
+  ];
+
+  function relatedRow(task) {
+    return taskRow(task, {
+      planName: task.planId ? (planById(task.planId) || {}).title : null,
+      onStatus: async (s) => {
+        try { await api.patchTask(task.id, { status: s }); await ctx.rerender(); }
+        catch (err) { toastError(err); }
+      },
+      onEdit: () => openTaskForm({
+        task,
+        plans: state.plans || [],
+        projects: state.projects || [],
+        onSaved: () => ctx.rerender(),
+      }),
+      onDelete: async () => {
+        const ok = await confirmDialog('删掉这个任务？', `「${task.title}」会被删除。`, '删掉');
+        if (!ok) return;
+        try { await api.deleteTask(task.id); toast('已删除。'); await ctx.rerender(); }
+        catch (err) { toastError(err); }
+      },
+    });
+  }
+
   root.appendChild(
     h('div.page.projects-page.project-detail-page', {}, [
       pageHead({
@@ -263,6 +293,26 @@ export default async function renderProjectDetail(root, ctx) {
               actionLabel: '添加第一门课程',
               onAction: openAddCourse,
             }),
+      ]),
+
+      h('div.section.project-task-section', {}, [
+        h('div.section-head.inline', {}, [
+          h('h2', {}, '相关待办'),
+          h('span.count', {}, `${relatedTasks.length} 条`),
+          h('button.btn.small.ghost', {
+            type: 'button',
+            style: { marginLeft: 'auto' },
+            onclick: () => openTaskForm({
+              plans: state.plans || [],
+              projects: state.projects || [],
+              defaults: { projectId: project.id },
+              onSaved: () => ctx.rerender(),
+            }),
+          }, '＋ 加待办'),
+        ]),
+        relatedTasks.length
+          ? h('div.task-list', {}, relatedSorted.map(relatedRow))
+          : h('p.tiny.muted', {}, '还没有归到这个项目的待办。让 AI 建的时候指定项目，或点右上角加一条。'),
       ]),
     ])
   );

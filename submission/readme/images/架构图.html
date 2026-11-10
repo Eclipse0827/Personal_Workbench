@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>功能架构</title>
+<style>
+  :root {
+    --paper: #ece6da;
+    --card: #f7f2e7;
+    --ink: #26382f;
+    --accent: #8b4a2f;
+    --gold: #8a6a2f;
+    --line: #c9c0ad;
+    --sage: #8fa08c;
+  }
+  @page { size: 1100px 1168px; margin: 0; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: Cambria, Palatino, "Noto Serif SC", "Source Han Serif SC", "SimSun", serif;
+  }
+  .wrap {
+    padding: 28px 34px 18px; height: 100%;
+    display: flex; flex-direction: column;
+  }
+  h1 { font-size: 36px; margin: 0 0 4px; font-weight: 600; letter-spacing: 2px; }
+  .sub { font-size: 17px; color: #6b6257; margin-bottom: 14px; letter-spacing: .4px; line-height: 1.45; }
+  .band {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-top: 3px solid #b9ab8e;
+    border-radius: 3px;
+    padding: 11px 16px 13px;
+    margin-bottom: 9px;
+  }
+  .band h2 {
+    font-size: 20px; margin: 0 0 9px; font-weight: 600; letter-spacing: 1.6px;
+    color: var(--gold);
+  }
+  .row { display: flex; gap: 10px; }
+  .row + .row { margin-top: 9px; }
+  .box {
+    flex: 1;
+    border: 1px solid var(--line);
+    background: #fcf8ef;
+    border-radius: 2px;
+    padding: 8px 11px;
+    font-size: 17px;
+    line-height: 1.55;
+  }
+  .box b { display: block; font-size: 19px; margin-bottom: 3px; letter-spacing: .3px; }
+  .box span { color: #5f584d; font-size: 17px; }
+  .entry .box { text-align: center; }
+  .arrow {
+    text-align: center; color: var(--sage); font-size: 17px; line-height: 1;
+    margin: 1px 0; letter-spacing: 6px;
+  }
+  .foot {
+    margin-top: auto; padding-top: 8px; font-size: 15px; color: #6f675c;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .tag {
+    display: inline-block; border: 1px solid var(--line); border-radius: 2px;
+    padding: 2px 8px; font-size: 15px; color: var(--gold); margin-right: 6px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>功能架构</h1>
+  <div class="sub">同一套服务端，三种外壳；数据只落在本机。不依赖数据库、不依赖前端框架、服务端运行时零第三方依赖。</div>
+
+  <div class="band entry">
+    <h2>三种外壳（同一份代码）</h2>
+    <div class="row">
+      <div class="box"><b>网页版</b><span>浏览器直接打开<br>Node 内置 HTTP 服务</span></div>
+      <div class="box"><b>桌面版</b><span>Electron 45<br>同一进程内可再开浮窗</span></div>
+      <div class="box"><b>安卓版</b><span>Capacitor 8 + 内嵌 Node<br>离线可用，数据在私有目录</span></div>
+    </div>
+  </div>
+
+  <div class="arrow">▼</div>
+
+  <div class="band">
+    <h2>表现层 · public/　约 2 万行，原生 JS，无框架</h2>
+    <div class="row">
+      <div class="box"><b>视图</b><span>工作台 / 待办与计划 / 专注 / 学习项目 / 教材精读 / 外刊阅读 / AI 整理空间</span></div>
+      <div class="box"><b>状态与交互</b><span>hash 路由、流式 Markdown、计时状态机（刷新不丢）</span></div>
+      <div class="box"><b>浏览器内能力</b><span>PDF.js 取文字与书签、高亮批注、按字符偏移还原阅读位置</span></div>
+    </div>
+  </div>
+
+  <div class="arrow">▼</div>
+
+  <div class="band">
+    <h2>服务端 · server/　约 1.6 万行，仅 Node 内置模块</h2>
+    <div class="row">
+      <div class="box"><b>编排层 · server.js</b><span>只做参数校验与流程编排；REST 接口 + 静态文件</span></div>
+      <div class="box"><b>数据层 · db.js / models.js</b><span>唯一持久化入口；字段白名单；软删除进回收站</span></div>
+      <div class="box"><b>领域模块</b><span>projects / textbook / articles / focus-stats</span></div>
+    </div>
+    <div class="row">
+      <div class="box"><b>AI 层 · ai.js / llm.js / tools.js</b><span>规则 / Ollama / 远程三引擎可切；工具调用最多 3 轮</span></div>
+      <div class="box"><b>模型配置 · model-config.js</b><span>多供应商、多模型、对话级 modelRef、Key 脱敏</span></div>
+      <div class="box"><b>本机能力 · ocr.js</b><span>Windows OCR 识别扫描版教材，含目录还原</span></div>
+    </div>
+  </div>
+
+  <div class="arrow">▼</div>
+
+  <div class="band" style="margin-bottom:0">
+    <h2>存储 · data/　一文件一条目，可读、可备份、可单条恢复</h2>
+    <div class="row">
+      <div class="box"><b>业务数据</b><span>tasks / plans / projects / conversations / textbooks / articles / vocabulary</span></div>
+      <div class="box"><b>专注与记忆</b><span>focus-active 唯一一份计时（网页与浮窗共用）/ focus-aliases / profile</span></div>
+      <div class="box"><b>底线</b><span>不连云、不上传、不需要账号；Key 只存本机；删除进 .trash 可找回</span></div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <span><span class="tag">自研 3.7 万行</span><span class="tag">自测 765 项</span><span class="tag">exe 与 APK 均已实测</span></span>
+    <span>缓一缓 · 个人学术工作台</span>
+  </div>
+</div>
+</body>
+</html>

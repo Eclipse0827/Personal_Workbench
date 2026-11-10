@@ -17,7 +17,7 @@ import {
   h, toast, toastError, pageHead,
   todayLabel, greeting, fmtDay, fmtRelative, truncate,
 } from '../ui.js';
-import { state, todayOpen, todayDone, isOverdue } from '../state.js';
+import { state, todayOpen, todayDone, isOverdue, projectById } from '../state.js';
 import { openTaskForm, openPlanForm } from './task-form.js';
 
 /** 今日计划最多先展示几条，其余折叠 */
@@ -42,6 +42,7 @@ export default async function renderDashboard(root, ctx) {
   function quickAdd() {
     openTaskForm({
       plans,
+      projects: state.projects,
       defaults: { scheduledDate: state.today },
       onSaved: () => ctx.rerender(),
     });
@@ -55,7 +56,35 @@ export default async function renderDashboard(root, ctx) {
     } catch (err) { toastError(err); }
   }
 
-  const editTask = (task) => openTaskForm({ task, plans, onSaved: () => ctx.rerender() });
+  const editTask = (task) => openTaskForm({ task, plans, projects: state.projects, onSaved: () => ctx.rerender() });
+
+  // ---------------------------------------------------------------- 主动提醒（最多一句）
+
+  /** 只在真有事时说一句；可以当天关掉，不弹窗、不红点、不催 */
+  function nudgeBar() {
+    const n = state.nudge;
+    if (!n || !n.text) return null;
+    const key = `nudge-dismissed:${state.today}:${n.kind}`;
+    try { if (localStorage.getItem(key) === '1') return null; } catch { /* 隐私模式下没有 localStorage */ }
+    return h('div.nudge-bar', {}, [
+      h('div.nudge-text', {}, [
+        h('span.nudge-main', {}, n.text),
+        n.hint ? h('span.nudge-hint', {}, n.hint) : null,
+      ]),
+      h('div.nudge-actions', {}, [
+        h('button.nudge-go', { type: 'button', onclick: () => ctx.navigate(n.to || '/tasks') }, n.action || '去看看'),
+        h('button.nudge-x', {
+          type: 'button',
+          title: '今天不再显示',
+          onclick: (e) => {
+            try { localStorage.setItem(key, '1'); } catch { /* 存不上就算了 */ }
+            const bar = e.target.closest('.nudge-bar');
+            if (bar) bar.remove();
+          },
+        }, '×'),
+      ]),
+    ]);
+  }
 
   // ---------------------------------------------------------------- 今日大卡
 
@@ -66,6 +95,9 @@ export default async function renderDashboard(root, ctx) {
     }, [
       h('span.bullet'),
       h('span.txt', {}, task.title),
+      task.projectId && projectById(task.projectId)
+        ? h('span.when.task-project-tag', { title: '所属学习项目' }, projectById(task.projectId).title)
+        : null,
       task.dueDate && task.dueDate === state.today
         ? h('span.when', {}, '今天截止')
         : task.scheduledDate === state.today
@@ -236,6 +268,8 @@ export default async function renderDashboard(root, ctx) {
           h('button.btn.primary', { onclick: quickAdd }, '＋ 新增任务'),
         ],
       }),
+
+      nudgeBar(),
 
       h('div.section', {}, [todayCard()]),
 

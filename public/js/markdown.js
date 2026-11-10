@@ -42,6 +42,31 @@ function startsList(line) {
   return BULLET_RE.test(line) || ORDERED_RE.test(line);
 }
 
+// ---------------------------------------------------------------- 表格
+// 只认「有表头分隔行」的写法，避免把正文里的竖线误判成表格：
+//   | 项 | 值 |
+//   | --- | --- |
+//   | a | b |
+function looksLikeRow(line) {
+  const t = line.trim();
+  return t.startsWith('|') && t.endsWith('|') && t.length > 2;
+}
+
+function isSeparatorRow(line) {
+  const t = line.trim();
+  if (!t.includes('-')) return false;
+  if (!t.includes('|')) return false;
+  return /^[|\s:-]+$/.test(t);
+}
+
+function splitCells(line) {
+  let t = line.trim();
+  if (t.startsWith('|')) t = t.slice(1);
+  if (t.endsWith('|')) t = t.slice(0, -1);
+  return t.split('|').map((s) => s.trim());
+}
+
+
 const NUMBER_MARKER_SRC = '(?:\\d{1,2}(?:[.)．](?!\\d)|、)|[（(]\\d{1,2}[）)]|[①-⑳])';
 const NUMBER_MARKER_RE = new RegExp(NUMBER_MARKER_SRC, 'g');
 const HEAD_START_PUNCT = /[\s。；;，,：:！!？?、]/;
@@ -122,6 +147,27 @@ export function renderMarkdown(text) {
       continue;
     }
 
+    // 表格：表头 + 分隔行 + 若干数据行
+    if (looksLikeRow(line) && i + 1 < lines.length && isSeparatorRow(lines[i + 1])) {
+      const head = splitCells(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && looksLikeRow(lines[i])) {
+        rows.push(splitCells(lines[i]));
+        i += 1;
+      }
+      const table = h('table.md-table', {}, [
+        h('thead', {}, [h('tr', {}, head.map((c) => h('th', {}, inline(c))))]),
+      ]);
+      if (rows.length) {
+        table.appendChild(
+          h('tbody', {}, rows.map((r) => h('tr', {}, head.map((_, ci) => h('td', {}, inline(r[ci] || ''))))))
+        );
+      }
+      frag.appendChild(h('div.md-table-wrap', {}, [table]));
+      continue;
+    }
+
     if (BULLET_RE.test(line)) {
       const list = h('ul.md-list');
       while (i < lines.length && BULLET_RE.test(lines[i])) {
@@ -130,6 +176,7 @@ export function renderMarkdown(text) {
         // 列表项中间的自然换行，只有在下一行不是新条目/标题/引用时并进来
         while (i < lines.length && lines[i].trim()
           && !startsList(lines[i])
+          && !(looksLikeRow(lines[i]) && i + 1 < lines.length && isSeparatorRow(lines[i + 1]))
           && !/^```|^#{1,4}\s|^>\s?/.test(lines[i])) {
           itemLines.push(lines[i].trim());
           i += 1;
@@ -147,6 +194,7 @@ export function renderMarkdown(text) {
         i += 1;
         while (i < lines.length && lines[i].trim()
           && !startsList(lines[i])
+          && !(looksLikeRow(lines[i]) && i + 1 < lines.length && isSeparatorRow(lines[i + 1]))
           && !/^```|^#{1,4}\s|^>\s?/.test(lines[i])) {
           itemLines.push(lines[i].trim());
           i += 1;
@@ -161,7 +209,8 @@ export function renderMarkdown(text) {
     i += 1;
     while (i < lines.length && lines[i].trim()
       && !/^```|^#{1,4}\s|^>\s?/.test(lines[i])
-      && !startsList(lines[i])) {
+      && !startsList(lines[i])
+      && !(looksLikeRow(lines[i]) && i + 1 < lines.length && isSeparatorRow(lines[i + 1]))) {
       body.push(lines[i]);
       i += 1;
     }

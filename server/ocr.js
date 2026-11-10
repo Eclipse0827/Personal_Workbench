@@ -46,6 +46,16 @@ async function readJson(file) {
 }
 
 async function getAvailability() {
+  // 手机版内嵌 Node 运行时不支持 child_process，跑不了 Windows OCR。
+  // 直接报不可用，让导入流程退回「文字层 / 手动填章节」，不要抛异常。
+  if (process.env.WB_DISABLE_NATIVE === '1') {
+    return {
+      available: false,
+      languages: [],
+      engine: 'windows-ocr',
+      reason: '手机版没有本机 OCR，请用带文字层的 PDF，或手动填写章节。',
+    };
+  }
   if (!availabilityPromise) {
     availabilityPromise = (async () => {
       const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'study-ocr-lang-'));
