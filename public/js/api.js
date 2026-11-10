@@ -1,12 +1,17 @@
 /**
  * 后端接口封装。
  * 页面组件不直接碰存储 —— 全部走这里，这也是将来换成后端 API 时唯一要改的地方。
+ *
+ * 浏览器 / 桌面：同源，空前缀。
+ * 真 App（Capacitor）：页面在 capacitor://localhost，Node 服务在 127.0.0.1:5180，
+ * 由 index.html 注入 WB_API_BASE，所有请求自动带上前缀。
  */
+const API_BASE = (typeof window !== 'undefined' && window.WB_API_BASE) || '';
 
 async function req(method, url, body) {
   let res;
   try {
-    res = await fetch(url, {
+    res = await fetch(`${API_BASE}${url}`, {
       method,
       headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -71,9 +76,63 @@ export const api = {
   getConversation: (id) => req('GET', `/api/conversations/${id}`).then((d) => d.conversation),
   patchConversation: (id, payload) => req('PATCH', `/api/conversations/${id}`, payload).then((d) => d.conversation),
   deleteConversation: (id) => req('DELETE', `/api/conversations/${id}`),
-  sendMessage: (id, content) => req('POST', `/api/conversations/${id}/messages`, { content }),
+  sendMessage: (id, content, modelRef) => req('POST', `/api/conversations/${id}/messages`, {
+    content, ...(modelRef ? { modelRef } : {}),
+  }),
+  /** 流式发消息：服务端按 SSE 推 open / status / partial / tool / done / error */
+  sendMessageStream: async (id, content, { onEvent, signal, retry = false, modelRef = null } = {}) => {
+    let res;
+    try {
+      res = await fetch(`${API_BASE}/api/conversations/${id}/messages?stream=1`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(
+          retry
+            ? { retry: true, ...(modelRef ? { modelRef } : {}) }
+            : { content, ...(modelRef ? { modelRef } : {}) }
+        ),
+        signal,
+      });
+    } catch (err) {
+      // 用户点了停止：原样往上抛，别伪装成「连不上服务」
+      if (err && err.name === 'AbortError') throw err;
+      throw new Error('连不上本地服务。请确认那个命令行窗口还开着（node server/server.js）。');
+    }
+    if (!res.ok || !res.body) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `请求失败（${res.status}）`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let doneEvent = null;
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const chunks = buf.split('\n\n');
+      buf = chunks.pop() || '';
+      for (const chunk of chunks) {
+        const line = chunk.trim();
+        if (!line.startsWith('data:')) continue;
+        let evt;
+        try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (evt.type === 'done') doneEvent = evt;
+        else if (evt.type === 'error') throw new Error(evt.error || '模型这一步没走通');
+        else if (typeof onEvent === 'function') onEvent(evt);
+      }
+    }
+
+    if (!doneEvent) throw new Error('连接断了，没拿到完整回复。');
+    return doneEvent;
+  },
   patchProblemCard: (id, messageId, payload) =>
     req('PATCH', `/api/conversations/${id}/messages/${messageId}`, payload).then((d) => d.conversation),
+  // 梳理卡里的「下一步」直接落成待办（点这一步就是确认）
+  confirmNextSteps: (id, messageId, steps) =>
+    req('POST', `/api/conversations/${id}/messages/${messageId}/next-steps`, { steps }),
 
   // 行动方案
   patchProposal: (id, proposalId, payload) =>
@@ -96,6 +155,11 @@ export const api = {
   // 设置
   settings: () => req('GET', '/api/settings'),
   patchSettings: (payload) => req('PATCH', '/api/settings', payload),
+  testModel: (payload) => req('POST', '/api/settings/test-model', payload),
+
+  // 长期记忆（跨对话仍然成立的事）
+  profile: () => req('GET', '/api/profile').then((d) => d.items || []),
+  clearProfile: () => req('DELETE', '/api/profile'),
 
   // AI 引擎状态（含本机 Ollama 探测）
   aiStatus: (refresh) => req('GET', `/api/ai/status${refresh ? '?refresh=1' : ''}`),
@@ -165,7 +229,7 @@ export const api = {
   uploadTextbookFile: async (id, file) => {
     let res;
     try {
-      res = await fetch(`/api/textbooks/${id}/file?name=${encodeURIComponent(file.name || '教材.pdf')}`, {
+      res = await fetch(`${API_BASE}/api/textbooks/${id}/file?name=${encodeURIComponent(file.name || '教材.pdf')}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/pdf' },
         body: file,

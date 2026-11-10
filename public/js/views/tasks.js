@@ -12,7 +12,7 @@ import {
   h, toast, toastError, confirmDialog, taskRow, emptyState, pageHead,
   fmtDay, truncate, PLAN_STATUS_LABEL,
 } from '../ui.js';
-import { state, allOpen, todayOpen, planById } from '../state.js';
+import { state, allOpen, todayOpen, planById, projectById } from '../state.js';
 import { openTaskForm, openPlanForm } from './task-form.js';
 import { launchFloatWindow } from '../float-launch.js';
 
@@ -56,9 +56,10 @@ export default async function renderTasks(root, ctx) {
 
   const rowFor = (task) => taskRow(task, {
     planName: task.planId ? (planById(task.planId) || {}).title : null,
+    projectName: task.projectId ? (projectById(task.projectId) || {}).title : null,
     onStatus: (s) => setStatus(task, s),
     onEdit: () => openTaskForm({
-      task, plans: activePlans, onSaved: () => ctx.rerender(),
+      task, plans: activePlans, projects: state.projects, onSaved: () => ctx.rerender(),
     }),
     onDelete: () => remove(task),
   });
@@ -66,6 +67,7 @@ export default async function renderTasks(root, ctx) {
   function newTask(defaults = {}) {
     openTaskForm({
       plans: activePlans,
+      projects: state.projects,
       defaults,
       onSaved: () => ctx.rerender(),
     });

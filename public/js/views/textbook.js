@@ -1120,6 +1120,23 @@ function renderSection(root, ctx, book, hit, flat, index) {
     return h('div.reader-msg-tools-wrap', {}, [tools, ...extra]);
   }
 
+  /** 把这条精读回答变成待办，带上教材与章节来源 */
+  async function answerToTask(msg) {
+    const raw = String(msg.content || '').replace(/\s+/g, ' ').trim();
+    if (!raw) return;
+    try {
+      await api.createTask({
+        title: raw.slice(0, 60),
+        description: `来自《${book.title}》${section.title || '本章'}的精读问答：\n${raw.slice(0, 500)}`,
+        source: 'ai',
+        sourceKind: 'reading',
+        sourceRefId: `textbook:${book.id}:${section.id || ''}`,
+        sourceLabel: `精读 · ${book.title}`,
+      });
+      toast('加到待办了。');
+    } catch (err) { toastError(err); }
+  }
+
   function chatMessageNode(msg, question = '', key = '') {
     if (msg.role === 'user') {
       return h('div.reader-msg.user', {}, [
@@ -1134,6 +1151,12 @@ function renderSection(root, ctx, book, hit, flat, index) {
       h('div.reader-msg-bubble', {}, renderMarkdown(msg.content)),
       msg.warning ? h('div.tiny.reader-msg-warning', {}, msg.warning) : null,
       assistantTools(msg, question, key),
+      h('div.reading-to-task', {}, [
+        h('button.reader-msg-tool', {
+          type: 'button',
+          onclick: () => answerToTask(msg),
+        }, '把这条变成待办'),
+      ]),
     ]);
   }
 

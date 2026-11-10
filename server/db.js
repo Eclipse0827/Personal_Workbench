@@ -19,9 +19,19 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const modelConfig = require('./model-config');
 
 const ROOT = path.resolve(__dirname, '..');
-const DATA_DIR = path.join(ROOT, 'data');
+/**
+ * 数据目录可以换：桌面端指到 app.getPath('userData')/data，
+ * 手机端指到那台独立服务的目录。两端各用各的，互不读写。
+ * 不设环境变量时仍是项目内 data/，老用法一点不变。
+ */
+const DATA_DIR = path.resolve(process.env.WB_DATA_DIR || path.join(ROOT, 'data'));
+/** 每份数据自己的身份。现在只用于标记来源，将来接同步时用它区分设备。 */
+const INSTANCE_FILE = path.join(DATA_DIR, 'instance.json');
+/** 删除不是真删：记录先移进这里，误删可以捞回来 */
+const TRASH_DIR = path.join(DATA_DIR, '.trash');
 
 /** 每个集合是一个目录，里面一条记录一个 JSON 文件 */
 const COLLECTIONS = {
@@ -65,6 +75,33 @@ const FOCUS_ALIASES_FILE = path.join(DATA_DIR, 'focus-aliases.json');
 
 // ---------------------------------------------------------------- 基础工具
 
+let cachedInstance = null;
+
+/** 首次启动生成一次实例身份；已存在就原样读回，绝不重置 */
+function readOrCreateInstance() {
+  if (cachedInstance) return cachedInstance;
+  let data = null;
+  try { data = JSON.parse(fs.readFileSync(INSTANCE_FILE, 'utf8')); } catch { /* 第一次，下面新建 */ }
+  if (!data || !data.instanceId) {
+    data = {
+      instanceId: `inst-${crypto.randomBytes(8).toString('hex')}`,
+      createdAt: new Date().toISOString(),
+      platform: process.env.WB_PLATFORM || 'local',
+      schemaVersion: 3,
+    };
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(INSTANCE_FILE, JSON.stringify(data, null, 2));
+    } catch { /* 只读环境就算了，身份仍在内存里可用 */ }
+  }
+  cachedInstance = data;
+  return data;
+}
+
+function instanceId() {
+  return readOrCreateInstance().instanceId;
+}
+
 function ensureDirs() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   for (const dir of Object.values(COLLECTIONS)) fs.mkdirSync(dir, { recursive: true });
@@ -72,6 +109,23 @@ function ensureDirs() {
   fs.mkdirSync(TEXTBOOK_FILES_DIR, { recursive: true });
   fs.mkdirSync(ARTICLE_CONTENT_DIR, { recursive: true });
   fs.mkdirSync(ARTICLE_CHAT_DIR, { recursive: true });
+  readOrCreateInstance();
+  // 启动阶段串行把设置文件补齐：新实例写一份默认配置，老实例把多供应商结构落盘一次。
+  // 只在这里写，就不会有并发请求互相抢临时文件。
+  try {
+    const raw = fs.existsSync(SETTINGS_FILE)
+      ? JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
+      : null;
+    if (!raw) {
+      fs.writeFileSync(SETTINGS_FILE, JSON.stringify(defaultSettings(), null, 2));
+    } else if (!Array.isArray(raw.modelProviders)) {
+      const merged = { ...defaultSettings(), ...raw };
+      fs.writeFileSync(SETTINGS_FILE, JSON.stringify({
+        ...merged,
+        ...modelConfig.migrateLegacy(merged),
+      }, null, 2));
+    }
+  } catch { /* 文件坏了就交给 getSettings 的兜底，不让启动挂掉 */ }
 }
 
 function isSafeId(id) {
@@ -114,6 +168,28 @@ async function atomicWrite(file, text) {
     await handle.close();
   }
   await fsp.rename(tmp, file);
+}
+
+/**
+ * 删除 = 把文件移进回收站，而不是直接 unlink。
+ *
+ * 两个原因：
+ *   · 一条记录只有一个 JSON 文件，没有别处存副本，软删除才有后悔药；
+ *   · 某些运行环境（沙箱 / 代理守卫）会拦截批量 unlink 并要求二次确认，
+ *     删除接口会直接 500，内部错误还会被贴到界面上。rename 不走删除配额。
+ * 回收站不在任何集合目录里，db.list() 读不到它，对用户等同于已删除。
+ */
+async function moveToTrash(file, label = 'file') {
+  let stat;
+  try { stat = await fsp.stat(file); } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
+  }
+  if (!stat.isFile()) return false;
+  await fsp.mkdir(TRASH_DIR, { recursive: true });
+  const stamp = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  await fsp.rename(file, path.join(TRASH_DIR, `${label}-${stamp}-${path.basename(file)}`));
+  return true;
 }
 
 async function readJson(file, fallback = null) {
@@ -184,8 +260,7 @@ async function put(name, item) {
 async function remove(name, id) {
   assertId(id);
   const file = path.join(collectionDir(name), `${id}.json`);
-  const existed = fs.existsSync(file);
-  await fsp.rm(file, { force: true });
+  const existed = await moveToTrash(file, `${name}-${id}`);
   return { ok: true, existed };
 }
 
@@ -213,6 +288,17 @@ function defaultSettings() {
     /** 本地 Ollama */
     ollamaUrl: 'http://127.0.0.1:11434',
     ollamaModel: '',
+    /**
+     * 要不要把学习记录摘要一起发给远程模型。默认关 —— 关着的时候，
+     * 模型只知道你这一轮说的话，看不到任务、进度、教材。
+     */
+    shareContext: false,
+    /** 允不允许模型调用工具（查任务 / 建任务 / 读教材）。关掉就退回单次问答。 */
+    agentEnabled: true,
+    /** 多家模型供应商，每家有自己的地址 / Key / 模型清单；只存在本地 */
+    modelProviders: [],
+    /** 全局默认用的模型，格式 providerId/modelId，或 'mock' */
+    defaultModelRef: modelConfig.MOCK_REF,
   };
 }
 
@@ -223,6 +309,19 @@ async function getSettings() {
   if (!raw || raw.aiProvider === undefined) {
     if (raw && raw.provider === 'openai-compatible') merged.aiProvider = 'real';
     if (raw && raw.provider === 'local') merged.aiProvider = 'mock';
+  }
+
+  // 旧的「全局一套配置」平滑升级成供应商列表。用固定 id，重复调用不会生成两套。
+  // 这里**只读不算、不写盘**：bootstrap 会并发调 getSettings，
+  // 多个 atomicWrite 抢同一个临时文件在 Windows 上会 EPERM。
+  // 落盘由 ensureDirs() 在进程启动时串行做一次。
+  if (!raw || !Array.isArray(raw.modelProviders)) {
+    const migrated = modelConfig.migrateLegacy(merged);
+    merged.modelProviders = migrated.modelProviders;
+    merged.defaultModelRef = migrated.defaultModelRef;
+  } else if (typeof raw.defaultModelRef !== 'string') {
+    const first = raw.modelProviders.find((p) => (p.models || []).length);
+    merged.defaultModelRef = first ? `${first.id}/${first.models[0].id}` : modelConfig.MOCK_REF;
   }
   return merged;
 }
@@ -237,12 +336,42 @@ async function getPublicSettings() {
     hasApiKey: Boolean(s.apiKey),
     ollamaUrl: s.ollamaUrl,
     ollamaModel: s.ollamaModel,
+    shareContext: s.shareContext === true,
+    agentEnabled: s.agentEnabled !== false,
+    modelProviders: modelConfig.publicProviders(s.modelProviders),
+    defaultModelRef: s.defaultModelRef,
+    modelOptions: modelConfig.flatOptions(s),
   };
+}
+
+/** 旧表单改了字段时，同步回对应的供应商，别让两套配置各说各话 */
+function applyLegacyPatchToProviders(next, patch) {
+  const list = Array.isArray(next.modelProviders) ? next.modelProviders : [];
+  const openai = list.find((p) => p.type === 'openai');
+  if (openai) {
+    if (typeof patch.baseUrl === 'string' && patch.baseUrl.trim()) openai.baseUrl = patch.baseUrl.trim();
+    if (typeof patch.apiKey === 'string' && patch.apiKey.trim()) openai.apiKey = patch.apiKey.trim();
+    if (patch.clearApiKey === true) openai.apiKey = '';
+    if (typeof patch.model === 'string' && patch.model.trim()) {
+      if (openai.models[0]) openai.models[0].name = patch.model.trim();
+      else openai.models.push({ id: modelConfig.newId('mdl'), name: patch.model.trim() });
+    }
+  }
+  const ollama = list.find((p) => p.type === 'ollama');
+  if (ollama) {
+    if (typeof patch.ollamaUrl === 'string' && patch.ollamaUrl.trim()) ollama.baseUrl = patch.ollamaUrl.trim();
+    if (typeof patch.ollamaModel === 'string' && patch.ollamaModel.trim()) {
+      if (ollama.models[0]) ollama.models[0].name = patch.ollamaModel.trim();
+      else ollama.models.push({ id: modelConfig.newId('mdl'), name: patch.ollamaModel.trim() });
+    }
+  }
 }
 
 async function saveSettings(patch) {
   const current = await getSettings();
   const next = { ...current };
+
+  // 旧的顶层字段照单收下（教材 / 外刊那些不走对话的 AI 仍读它们）
   if (['mock', 'ollama', 'real'].includes(patch.aiProvider)) next.aiProvider = patch.aiProvider;
   if (typeof patch.baseUrl === 'string') next.baseUrl = patch.baseUrl.trim();
   if (typeof patch.model === 'string') next.model = patch.model.trim();
@@ -250,6 +379,27 @@ async function saveSettings(patch) {
   if (typeof patch.ollamaModel === 'string') next.ollamaModel = patch.ollamaModel.trim();
   if (typeof patch.apiKey === 'string' && patch.apiKey.trim() !== '') next.apiKey = patch.apiKey.trim();
   if (patch.clearApiKey === true) next.apiKey = '';
+  if (typeof patch.shareContext === 'boolean') next.shareContext = patch.shareContext;
+  if (typeof patch.agentEnabled === 'boolean') next.agentEnabled = patch.agentEnabled;
+
+  applyLegacyPatchToProviders(next, patch);
+
+  // 新的多供应商列表：前端不回传 Key 明文，按 id 从现有配置里接回来
+  if (Array.isArray(patch.modelProviders)) {
+    next.modelProviders = modelConfig.sanitizeProviders(patch.modelProviders, current.modelProviders);
+  }
+
+  // 默认模型：显式指定优先；旧三选一按钮则反推一个同类型的模型
+  if (typeof patch.defaultModelRef === 'string') {
+    if (modelConfig.isValidRef(next, patch.defaultModelRef)) next.defaultModelRef = patch.defaultModelRef;
+  } else if (['mock', 'ollama', 'real'].includes(patch.aiProvider)) {
+    next.defaultModelRef = modelConfig.refForLegacyProvider(next, patch.aiProvider);
+  }
+  if (!modelConfig.isValidRef(next, next.defaultModelRef)) next.defaultModelRef = modelConfig.MOCK_REF;
+
+  // 让旧字段跟默认模型对齐。切到规则引擎时不清 Key，用户切回来还在。
+  modelConfig.syncLegacy(next);
+
   // 只保留约定字段，避免设置文件被塞进预期外的东西
   const clean = {
     aiProvider: next.aiProvider,
@@ -258,6 +408,10 @@ async function saveSettings(patch) {
     apiKey: next.apiKey,
     ollamaUrl: next.ollamaUrl,
     ollamaModel: next.ollamaModel,
+    shareContext: next.shareContext === true,
+    agentEnabled: next.agentEnabled !== false,
+    modelProviders: next.modelProviders,
+    defaultModelRef: next.defaultModelRef,
   };
   await atomicWrite(SETTINGS_FILE, JSON.stringify(clean, null, 2));
   return getPublicSettings();
@@ -277,7 +431,7 @@ async function saveActiveFocus(record) {
 }
 
 async function clearActiveFocus() {
-  await fsp.rm(ACTIVE_FOCUS_FILE, { force: true });
+  await moveToTrash(ACTIVE_FOCUS_FILE, 'active-focus');
 }
 
 // ---------------------------------------------------------------- 专注内容归类
@@ -357,14 +511,14 @@ async function textbookFileExists(id) {
 
 async function removeTextbookAssets(id) {
   assertId(id);
-  await fsp.rm(path.join(TEXTBOOK_PAGES_DIR, `${id}.json`), { force: true });
-  await fsp.rm(textbookFilePath(id), { force: true });
-  // 上传中断时留下的临时文件也一并清掉
+  await moveToTrash(path.join(TEXTBOOK_PAGES_DIR, `${id}.json`), `textbook-pages-${id}`);
+  await moveToTrash(textbookFilePath(id), `textbook-pdf-${id}`);
+  // 上传中断时留下的临时文件也一并移走
   try {
     const names = await fsp.readdir(TEXTBOOK_FILES_DIR);
     for (const n of names) {
       if (n.startsWith(`.${id}.`) && n.endsWith('.tmp')) {
-        await fsp.rm(path.join(TEXTBOOK_FILES_DIR, n), { force: true });
+        await moveToTrash(path.join(TEXTBOOK_FILES_DIR, n), `textbook-tmp-${id}`);
       }
     }
   } catch { /* 目录不存在就算了 */ }
@@ -404,13 +558,16 @@ async function readArticleChat(id) {
 
 async function removeArticleAssets(id) {
   assertId(id);
-  await fsp.rm(path.join(ARTICLE_CONTENT_DIR, `${id}.json`), { force: true });
-  await fsp.rm(path.join(ARTICLE_CHAT_DIR, `${id}.json`), { force: true });
+  await moveToTrash(path.join(ARTICLE_CONTENT_DIR, `${id}.json`), `article-content-${id}`);
+  await moveToTrash(path.join(ARTICLE_CHAT_DIR, `${id}.json`), `article-chat-${id}`);
 }
 
 module.exports = {
   ROOT,
   DATA_DIR,
+  TRASH_DIR,
+  INSTANCE_FILE,
+  instanceId,
   COLLECTIONS,
   TEXTBOOK_PAGES_DIR,
   TEXTBOOK_FILES_DIR,

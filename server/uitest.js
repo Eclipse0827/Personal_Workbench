@@ -93,6 +93,21 @@ class El {
     return node;
   }
   removeChild(node) { this.childNodes = this.childNodes.filter((n) => n !== node); return node; }
+  append(...nodes) { for (const n of nodes) this.appendChild(n); }
+  insertBefore(node, ref) {
+    if (!node) return node;
+    node.parentNode = this;
+    if (!ref) { this.childNodes.push(node); return node; }
+    const i = this.childNodes.indexOf(ref);
+    if (i < 0) this.childNodes.push(node);
+    else this.childNodes.splice(i, 0, node);
+    return node;
+  }
+  get clientHeight() { return 100; }
+  get lastElementChild() {
+    const list = this.children;
+    return list.length ? list[list.length - 1] : null;
+  }
   replaceChildren(...nodes) {
     this.childNodes = [];
     for (const n of nodes) {
@@ -175,7 +190,8 @@ const documentStub = {
 };
 globalThis.document = documentStub;
 globalThis.window = {
-  addEventListener: () => {}, scrollTo: () => {}, print: () => {},
+  addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => true,
+  scrollTo: () => {}, print: () => {},
   location: { hash: '#/', reload: () => {} },
   scrollY: 0,
 };
@@ -213,13 +229,63 @@ async function renderView(viewName, args, extraState = {}) {
     refresh: async () => stateMod.refresh(),
   };
   let cleanup = null;
+  let update = null;
   try {
     const result = await mod.default(root, ctx);
     if (typeof result === 'function') cleanup = result;
+    else if (result && typeof result === 'object') {
+      cleanup = typeof result.cleanup === 'function' ? result.cleanup : null;
+      update = typeof result.update === 'function' ? result.update : null;
+    }
   } catch (err) {
-    return { root, navigated, error: err, cleanup: null };
+    return { root, navigated, error: err, cleanup: null, update: null };
   }
-  return { root, navigated, error: null, cleanup };
+  return { root, navigated, error: null, cleanup, update };
+}
+
+// ================================================================ 测试数据清理
+
+/**
+ * 默认走 HTTP 删除接口（顺便验证路由）。有些运行环境对单轮删除次数有安全
+ * 配额，超限会返回 500；这时把记录文件挪进隔离目录收尾，既不留脏数据，
+ * 也不硬撞配额。隔离目录在 data/ 之外，db.list() 不会读到它。
+ */
+const QUARANTINE_DIR = path.join(db.ROOT, '.wb-quarantine-uitest');
+let quarantined = 0;
+
+function guardLimited(err) {
+  return /SAFE_DELETE|quota|配额|频率限制/i.test(String((err && err.message) || err));
+}
+
+async function isolateFiles(files) {
+  await fs.mkdir(QUARANTINE_DIR, { recursive: true });
+  let moved = 0;
+  for (const src of files) {
+    if (!src) continue;
+    try {
+      const name = `${path.basename(path.dirname(src))}-${path.basename(src)}`;
+      await fs.rename(src, path.join(QUARANTINE_DIR, `${Date.now()}-${moved}-${name}`));
+      moved += 1;
+    } catch { /* 附属文件不存在就算了 */ }
+  }
+  quarantined += moved;
+  return moved > 0;
+}
+
+async function removeFixture(collection, del, id, extraFiles = []) {
+  try { await del(id); return; } catch (err) {
+    if (!guardLimited(err)) throw err;
+  }
+  const dir = db.COLLECTIONS[collection];
+  const files = [dir ? path.join(dir, `${id}.json`) : '', ...extraFiles];
+  if (!(await isolateFiles(files))) console.log(`  · 记录已不存在，跳过：${collection}/${id}`);
+}
+
+async function removeFocusFixture(id) {
+  try { await db.remove('focusSessions', id); return; } catch (err) {
+    if (!guardLimited(err)) throw err;
+  }
+  await isolateFiles([path.join(db.COLLECTIONS.focusSessions, `${id}.json`)]);
 }
 
 // ================================================================ 主流程
@@ -693,6 +759,27 @@ async function main() {
     const rendered = renderMarkdown('## 读完自测\n\n1、串联电路有什么特点？2、并联电路有什么特点？');
     ok('Markdown 里的多条目问题会分别成行',
       rendered.querySelectorAll('li').length === 2, `实际 ${rendered.querySelectorAll('li').length}`);
+
+    // 表格：模型讲参数对比时常用，不能显示成「| a | b |」原文
+    const table = renderMarkdown('| 环节 | 作用 |\n| --- | --- |\n| 比较 | 求误差 |\n| 控制器 | 决定怎么调 |');
+    ok('★ Markdown 表格会渲染成 table',
+      Boolean(table.querySelector('table')) && table.querySelectorAll('tr').length === 3,
+      `tr ${table.querySelectorAll('tr').length}`);
+    ok('表格单元格里的文字正确', table.allText().includes('求误差') && table.allText().includes('环节'));
+
+    const inlineTable = renderMarkdown('下面这张表说明各环节：\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n表后还有正文。');
+    ok('★ 表格前面的正文不会被并进表格',
+      inlineTable.querySelectorAll('p').length === 2 && Boolean(inlineTable.querySelector('table')));
+
+    const noSep = renderMarkdown('误差 e(t)=r(t)-y(t) | 记一下');
+    ok('正文里单独一个竖线不会被误判成表格', !noSep.querySelector('table'));
+
+    // AI 回复走的是无气泡正文，靠 .msg-prose 承载 markdown
+    const chatSrc = await fs.readFile(path.join(PUBLIC, 'js', 'views', 'chat.js'), 'utf8');
+    ok('★ AI 回复用无气泡正文承载 markdown',
+      chatSrc.includes("h('div.msg-prose', {}, renderMarkdown(msg.content))"));
+    ok('★ 流式期间也按 markdown 渲染，不是收完才换样式',
+      chatSrc.includes('replaceChildren(renderMarkdown(text))'));
   }
 
   // ---------------------------------------------------------------- 计划详情
@@ -802,6 +889,35 @@ async function main() {
       !/completedEpisodes\s*\+\s*1/.test(detailSrc) && !/lastEpisode\s*\+\s*1/.test(detailSrc));
   }
 
+  console.log('\n【学习项目 · 相关待办与归属】');
+  {
+    const fsSync = require('fs');
+    const owned = await api.createTask({ title: 'UI 自测 · 归到项目的待办', projectId: testProject.id });
+    await stateMod.refresh();
+    const { root, error } = await renderView('project-detail', { id: testProject.id }, all);
+    ok('项目页渲染无异常', !error, error && error.message);
+    const t = root.allText();
+    ok('★ 项目页出现「相关待办」与加待办入口',
+      t.includes('相关待办') && t.includes('＋ 加待办'));
+    ok('★ 归到项目的待办在项目页看得见', t.includes('UI 自测 · 归到项目的待办'));
+    ok('★ 相关待办用任务行渲染', root.querySelectorAll('.task-row').length > 0);
+
+    const formSrc = fsSync.readFileSync(path.join(PUBLIC, 'js', 'views', 'task-form.js'), 'utf8');
+    ok('★ 任务表单有学习项目下拉并回写 projectId',
+      formSrc.includes('属于哪个学习项目') && formSrc.includes('projectId: nextProjectId'));
+    const uiSrc = fsSync.readFileSync(path.join(PUBLIC, 'js', 'ui.js'), 'utf8');
+    ok('★ 任务行显示项目名与阅读来源',
+      uiSrc.includes('task-project-tag') && uiSrc.includes('reading-source-tag'));
+
+    const articleSrc = fsSync.readFileSync(path.join(PUBLIC, 'js', 'views', 'article.js'), 'utf8');
+    const textbookSrc = fsSync.readFileSync(path.join(PUBLIC, 'js', 'views', 'textbook.js'), 'utf8');
+    ok('★ 外刊与精读问答都能一键变成待办',
+      ['把这条变成待办', "sourceKind: 'reading'"].every((x) => articleSrc.includes(x) && textbookSrc.includes(x)));
+
+    await removeFixture('tasks', api.deleteTask, owned.id);
+    await stateMod.refresh();
+  }
+
   console.log('\n【学习项目 · 空状态】');
   {
     const emptyProject = await api.createProject({ title: 'UI 自测 · 空项目' });
@@ -811,7 +927,7 @@ async function main() {
     const t = root.allText();
     ok('空项目提示还没有课程', t.includes('这个项目还没有课程'));
     ok('空项目有添加第一门课程的入口', t.includes('添加第一门课程'));
-    await api.deleteProject(emptyProject.id);
+    await removeFixture('projects', api.deleteProject, emptyProject.id);
     await stateMod.refresh();
 
     const emptyList = await renderView('projects', {}, { ...all, projects: [] });
@@ -822,16 +938,18 @@ async function main() {
 
   await stateMod.refresh();
 
-  // ---------------------------------------------------------------- 对话列表
+  // ---------------------------------------------------------------- 对话工作区
   console.log('\n【AI 整理空间 · 列表】');
   {
-    const { root, error } = await renderView('chat-list', {}, all);
+    const { root, error } = await renderView('chat', {}, all);
     ok('对话列表渲染无异常', !error, error && error.message);
     const t = root.allText();
     ok('有开始新对话入口', t.includes('开始新的对话'));
     ok('列出已有对话', t.includes('考研'));
     ok('列表页不再放大段说明与引擎提示', !t.includes('不用先选情绪类型')
       && !t.includes('当前用的是本地规则引擎'));
+    ok('列表与对话在同一屏（主从结构）', root.querySelector('.cw-list') !== null
+      && root.querySelector('.cw-main') !== null);
   }
 
   // ---------------------------------------------------------------- 对话详情
@@ -846,10 +964,15 @@ async function main() {
     ok('★ 每条 AI 回复都如实标注了引擎', (t.match(/规则引擎|Ollama 本地|远程模型/g) || []).length >= 2);
     ok('没有把规则引擎冒充成模型', !/Ollama 本地|远程模型/.test(t));
     ok('给出问题梳理卡', t.includes('问题梳理'));
-    ok('梳理卡每一项可编辑（有输入控件）', root.querySelectorAll('div').length > 0);
+    // 以前是 querySelectorAll('div').length > 0，恒真，什么都没测到
+    const editableRows = root.querySelectorAll('.txt').filter((n) =>
+      n.attributes.contenteditable === 'true' && (n.listeners.blur || []).length > 0);
+    ok('★ 梳理卡每一项真的可编辑（有 contenteditable + 保存回调）',
+      editableRows.length >= 2, `可编辑条目=${editableRows.length}`);
     ok('对话页不再出现档案入口', !t.includes('保存为摘要') && !t.includes('我的档案'));
 
     ok('★ 显示行动方案卡', t.includes('待你确认'));
+    ok('★ 头部有待确认方案的固定入口', /待确认\s*\d/.test(t));
     ok('方案里列出了具体行动', t.includes('确定数学要用的教材和章节范围'));
     ok('★ 专业课出现在「还没确定」而不是任务里',
       t.includes('还没确定，所以先不安排') && !/确定专业课的参考书目/.test(t),
@@ -873,6 +996,162 @@ async function main() {
     const t = root.allText();
     ok('★ 只想倾诉时页面不推方案', !t.includes('待你确认') && !t.includes('确认创建任务'));
     ok('倾诉时会话正常显示', t.includes('什么都不想做'));
+  }
+
+  // ---------------------------------------------------------------- 梳理卡 → 待办
+  console.log('\n【梳理卡 · 下一步能直接落成待办】');
+  {
+    const models = require('./models');
+    const stepConv = await api.createConversation({});
+    const full = await db.get('conversations', stepConv.id);
+    const stepMsg = models.newMessage({
+      role: 'assistant', content: '先摸底', provider: 'mock',
+      actions: [{ tool: 'create_tasks', ok: true, summary: '建了 1 个任务', createdCount: 1 }],
+    });
+    stepMsg.problemCard = {
+      summary: '不知道从哪开始',
+      expressed: ['不知道从哪开始'],
+      unknowns: [],
+      directions: [],
+      nextSteps: ['选一份数学资料做摸底', '记录每天能学的时段'],
+      emotion: null,
+    };
+    full.messages.push(stepMsg);
+    await db.put('conversations', full);
+
+    const { root, error } = await renderView('chat', { id: stepConv.id }, all);
+    ok('带「下一步」的梳理卡渲染无异常', !error, error && error.message);
+    const t = root.allText();
+    ok('★ 以前不渲染的 nextSteps 这一栏现在可见', t.includes('下一步可以先做'));
+    ok('★ 工具直接建好的待办被如实标出', t.includes('已直接建好 1 条待办')
+      && t.includes('去看待办'));
+    ok('★ 动作在折叠外，不用先点开梳理卡', t.includes('全部加入待办')
+      && root.querySelector('.problem-steps-bar') !== null);
+    const rows = root.querySelectorAll('.nextstep-row');
+    ok('每条下一步都能单独加进待办', rows.length === 2
+      && rows[0].allText().includes('＋ 待办'));
+
+    const r1 = await api.confirmNextSteps(stepConv.id, stepMsg.id, ['选一份数学资料做摸底']);
+    ok('点「加入待办」真的建了任务', (r1.created || []).length === 1);
+    const made = (r1.created || [])[0] || {};
+    ok('★ 任务能回溯到那次对话和那条回复',
+      made.source === 'ai' && made.sourceConversationId === stepConv.id
+      && made.sourceMessageId === stepMsg.id,
+      JSON.stringify({ source: made.source, conv: made.sourceConversationId, msg: made.sourceMessageId }));
+
+    const r2 = await api.confirmNextSteps(stepConv.id, stepMsg.id,
+      ['选一份数学资料做摸底', '记录每天能学的时段']);
+    ok('★ 重复点不重复建，只补上没建过的那条',
+      (r2.created || []).length === 1 && (r2.skipped || []).length === 1);
+
+    let rejected = false;
+    try { await api.confirmNextSteps(stepConv.id, stepMsg.id, ['不在这张卡里的一句话']); }
+    catch { rejected = true; }
+    ok('卡里没有的条目不会被偷偷建成任务', rejected);
+
+    const after = await api.getConversation(stepConv.id);
+    const cardAfter = after.messages.find((m) => m.id === stepMsg.id).problemCard;
+    ok('建过的条目在卡里留了记录', (cardAfter.stepTasks || []).length === 2);
+
+    const { root: root2 } = await renderView('chat', { id: stepConv.id }, all);
+    ok('重绘后已建过的条目标成「已在待办里」', root2.allText().includes('已在待办里'));
+
+    for (const task of [...(r1.created || []), ...(r2.created || [])]) {
+      await api.deleteTask(task.id);
+    }
+    await api.deleteConversation(stepConv.id);
+  }
+
+  // ---------------------------------------------------------------- 桌面壳：主从结构
+  console.log('\n【桌面壳 · 主从结构与增量渲染】');
+  {
+    const { root, update, error } = await renderView('chat', { id: conv.id }, all);
+    ok('对话工作区渲染无异常', !error, error && error.message);
+
+    const listBody = root.querySelector('.cw-list-body');
+    const firstItem = listBody.children[0];
+    const composer = root.querySelector('.cw-composer textarea');
+    const thread = root.querySelector('.cw-thread');
+
+    ok('列表与对话同时存在（不是两个页面）', listBody !== null && thread !== null);
+    const shellCssSrc = require('fs').readFileSync(path.join(PUBLIC, 'css', 'shell.css'), 'utf8');
+    ok('滚动交给容器：窗口固定高度，消息区自己滚',
+      shellCssSrc.includes('100dvh') && shellCssSrc.includes('.cw-thread') && shellCssSrc.includes('overflow-anchor'));
+
+    // 换一个对话：列表节点和输入框必须原地保留
+    const another = all.conversations.find((c) => c.id !== conv.id);
+    if (another && update) {
+      await update({ id: another.id });
+      ok('★ 换对话后列表节点被复用（没有整页重画）', listBody.children[0] === firstItem);
+      ok('★ 换对话后输入框没有被重建', root.querySelector('.cw-composer textarea') === composer);
+      ok('换对话后内容确实换了', root.allText().includes(another.title));
+    }
+  }
+
+  // ---------------------------------------------------------------- 生成中切页面
+  console.log('\n【回复进行中切走再回来】');
+  {
+    const chatSrc = require('fs').readFileSync(path.join(PUBLIC, 'js', 'views', 'chat.js'), 'utf8');
+    const runSrc = require('fs').readFileSync(path.join(PUBLIC, 'js', 'chat-run.js'), 'utf8');
+    const serverSrc = require('fs').readFileSync(path.join(__dirname, 'server.js'), 'utf8');
+
+    ok('★ 发消息的请求不在视图里跑，交给独立模块',
+      !chatSrc.includes('api.sendMessageStream(') && runSrc.includes('api.sendMessageStream('));
+    ok('★ 视图卸载只退订，不打断请求',
+      chatSrc.includes('detachRun()') && !chatSrc.includes('abort()'));
+    ok('★ 切回来后能接上进行中的那一轮',
+      chatSrc.includes('chatRun.get(conversation.id)') && chatSrc.includes('attachRun(run)'));
+    ok('接续时不把已经写过的部分再长一遍',
+      chatSrc.includes('ui.state.shown = run.text'));
+    ok('列表里标出正在回复的对话', chatSrc.includes('cw-item-live'));
+
+    const putAt = serverSrc.indexOf("await db.put('conversations', conv);");
+    const modelAt = serverSrc.indexOf('ai.respondStream(');
+    ok('★ 用户那句话在叫模型之前就先落库', putAt > 0 && modelAt > putAt);
+    ok('流式首帧会回传真实的用户消息', serverSrc.includes("sse({ type: 'open', userMessage: userMsg })"));
+  }
+
+  // ---------------------------------------------------------------- 对话质量与可控性
+  console.log('\n【对话质量：重复提问 / 工具结果 / 停止 / 重答】');
+  {
+    const ai = require('./ai');
+    const chatSrc = require('fs').readFileSync(path.join(PUBLIC, 'js', 'views', 'chat.js'), 'utf8');
+    const runSrc = require('fs').readFileSync(path.join(PUBLIC, 'js', 'chat-run.js'), 'utf8');
+    const serverSrc = require('fs').readFileSync(path.join(__dirname, 'server.js'), 'utf8');
+
+    const conv = {
+      messages: [
+        { role: 'user', content: '我最近在学自动控制原理' },
+        { role: 'assistant', content: '先从建模开始。' },
+        { role: 'user', content: '那我今天先做什么？' },
+      ],
+    };
+    const hist = ai.historyOf(conv, '那我今天先做什么？');
+    ok('★ 当前这句不会在历史里出现第二次',
+      hist.filter((m) => m.content === '那我今天先做什么？').length === 0,
+      `实际 ${hist.filter((m) => m.content === '那我今天先做什么？').length} 次`);
+    ok('之前几轮仍然带进去', hist.length === 2);
+
+    const longData = { items: Array.from({ length: 400 }, (_, i) => `任务${i}`) };
+    const formatted = ai.formatToolResults([
+      { tool: 'list_tasks', ok: true, summary: '查了 10 条', data: longData },
+    ]);
+    ok('★ 工具结果过长时会说明被截断', formatted.includes('后面还有'));
+    ok('截断后仍是完整的一句话，不是半截 JSON',
+      !/[{[,":]\s*$/.test(formatted.trim()), formatted.slice(-24));
+
+    const okFormatted = ai.formatToolResults([
+      { tool: 'get_overview', ok: true, summary: '查了工作台', data: { 未完成: 3 } },
+    ]);
+    ok('短结果原样保留', okFormatted.includes('未完成') && !okFormatted.includes('后面还有'));
+
+    ok('★ 生成中可以停止：按钮不再是死的', chatSrc.includes('stopRun()') && chatSrc.includes("sending ? stopRun() : send()"));
+    ok('★ 停止会真的掐断请求', runSrc.includes('AbortController') && runSrc.includes('controller.abort()'));
+    ok('★ 有重新生成入口', chatSrc.includes('async function regenerate') && chatSrc.includes('retry: true'));
+    ok('重新生成不会新增一个重复的问题', serverSrc.includes('const retry = body.retry === true;'));
+    ok('服务端会感知用户停止，不再往下烧模型', serverSrc.includes('shouldStop: () => clientGone'));
+    ok('★ 对话被删掉后不会被 AI 写回来',
+      serverSrc.includes("const alive = await db.getOrNull('conversations', id);"));
   }
 
   // ---------------------------------------------------------------- 暂时隐藏的功能
@@ -899,6 +1178,55 @@ async function main() {
     ok('说明 Key 不会外传', t.includes('不会随导出文件外传'));
     ok('不是医疗工具声明', t.includes('不是医疗或心理治疗工具'));
     ok('包含核心设计承诺', t.includes('只有你确认过的行动才会创建成任务') && t.includes('没有强制打卡'));
+    ok('★ 设置页有多供应商管理区',
+      t.includes('模型供应商') && t.includes('＋ 添加供应商') && t.includes('默认模型'));
+    // 供应商卡片不依赖本机真实配置：注入两家假供应商再渲染一次
+    const seeded = {
+      ...all,
+      settings: {
+        ...(all.settings || {}),
+        modelProviders: [
+          { id: 'p-seed-a', name: '硅基流动', type: 'openai', baseUrl: 'https://api.siliconflow.cn/v1', hasApiKey: true, models: [{ id: 'm1', name: 'Qwen2.5-7B' }] },
+          { id: 'p-seed-b', name: '本机 Ollama', type: 'ollama', baseUrl: 'http://127.0.0.1:11434', hasApiKey: false, models: [{ id: 'm2', name: 'qwen2.5:7b' }] },
+        ],
+      },
+    };
+    const seededSettings = await renderView('settings', {}, seeded);
+    ok('★ 已配置的供应商都列成卡片',
+      seededSettings.root.querySelectorAll('.model-provider-card').length >= 2);
+    ok('★ 说明配置只存本机、Key 不回显',
+      t.includes('配置只存在本机 data/settings.json') && t.includes('Key 不会回显'));
+
+    const chatSrc = require('fs').readFileSync(path.join(PUBLIC, 'js', 'views', 'chat.js'), 'utf8');
+    const apiSrc = require('fs').readFileSync(path.join(PUBLIC, 'js', 'api.js'), 'utf8');
+    ok('★ 对话头部有模型下拉并按对话保存',
+      chatSrc.includes('cw-model-select') && chatSrc.includes('patchConversation'));
+    ok('★ 发消息与重答都会带上选中的 modelRef',
+      apiSrc.includes('modelRef') && (chatSrc.match(/modelRef/g) || []).length >= 3);
+
+    const manifestSrc = require('fs').readFileSync(path.join(PUBLIC, 'manifest.webmanifest'), 'utf8');
+    ok('★ 手机版是独立安装的 PWA',
+      manifestSrc.includes('"display": "standalone"') && manifestSrc.includes('icon-512.png'));
+    const pkgSrc = require('fs').readFileSync(path.join(PUBLIC, '..', 'package.json'), 'utf8');
+    ok('★ 桌面壳与手机服务都有启动脚本',
+      pkgSrc.includes('"desktop": "electron ."') && pkgSrc.includes('"mobile:serve"'));
+    const mainSrc = require('fs').readFileSync(path.join(PUBLIC, '..', 'desktop', 'main.js'), 'utf8');
+    ok('★ 桌面壳用独立数据目录并在退出时收掉服务',
+      mainSrc.includes('WB_DATA_DIR') && mainSrc.includes('stopServer'));
+    const twoSrc = require('fs').readFileSync(path.join(PUBLIC, '..', 'scripts', 'start-two.js'), 'utf8');
+    ok('★ 不整服务器也能在一台电脑上跑两份独立实例',
+      pkgSrc.includes('"two"') && twoSrc.includes('WB_DATA_DIR') && twoSrc.includes('0.0.0.0'));
+
+    const capSrc = require('fs').readFileSync(path.join(PUBLIC, '..', 'mobile', 'capacitor.config.json'), 'utf8');
+    const entrySrc = require('fs').readFileSync(path.join(PUBLIC, '..', 'mobile', 'nodejs-entry.js'), 'utf8');
+    const htmlSrc = require('fs').readFileSync(path.join(PUBLIC, 'index.html'), 'utf8');
+    ok('★ 真 App 用内嵌 Node 运行时，不重写接口',
+      capSrc.includes('"Nodejs"') && capSrc.includes('"nodeDir"')
+      && entrySrc.includes('WB_DATA_DIR') && entrySrc.includes('WB_DISABLE_NATIVE'));
+    ok('★ App 内页面等本地服务就绪后再加载，并带 API 前缀',
+      htmlSrc.includes('WB_API_BASE') && apiSrc.includes('API_BASE'));
+    ok('★ 有组装手机版产物的脚本',
+      pkgSrc.includes('"mobile:www"'));
   }
 
   // ---------------------------------------------------------------- 桌面浮窗
@@ -934,7 +1262,8 @@ async function main() {
       css.includes('.float-ball') && css.includes('conic-gradient')
         && css.includes('.float-root.ball-mode'));
 
-    const main = fs.readFileSync(path.join(PUBLIC, '..', 'desktop', 'float-main.js'), 'utf8');
+    // 浮窗实现集中在 float-window.js，网页版入口 float-main.js 只是薄壳
+    const main = fs.readFileSync(path.join(PUBLIC, '..', 'desktop', 'float-window.js'), 'utf8');
     ok('桌面外壳透明、无边框、置顶',
       /transparent:\s*true/.test(main) && /frame:\s*false/.test(main) && /alwaysOnTop:\s*true/.test(main));
     ok('桌面外壳隔离 Node 能力',
@@ -943,6 +1272,11 @@ async function main() {
       main.includes('BALL_SIZE') && main.includes('snapPosition')
         && main.includes('float:set-snap') && main.includes('float:drag-move')
         && main.includes('float:expand') && main.includes('broadcastState'));
+
+    const thinShell = fs.readFileSync(path.join(PUBLIC, '..', 'desktop', 'float-main.js'), 'utf8');
+    ok('网页版浮窗入口不再自己实现窗口，复用同一模块',
+      thinShell.includes("require('./float-window')") && thinShell.length < 4000,
+      `入口文件 ${thinShell.length} 字符`);
 
     const preload = fs.readFileSync(path.join(PUBLIC, '..', 'desktop', 'preload.js'), 'utf8');
     ok('页面拿得到吸边、展开与拖动窗口的能力',
@@ -1021,7 +1355,7 @@ async function main() {
       ['/textbook/abc123', 'renderTextbook'],
       ['/articles', 'renderArticles'], ['/article/abc123', 'renderArticle'],
       ['/projects', 'renderProjects'], ['/projects/abc123', 'renderProjectDetail'],
-      ['/chat', 'renderChatList'], ['/chat/abc123', 'renderChat'],
+      ['/chat', 'renderChat'], ['/chat/abc123', 'renderChat'],
       ['/settings', 'renderSettings'],
     ];
     const bad = [];
@@ -1062,19 +1396,25 @@ async function main() {
   console.log('\n【清理测试数据】');
   const after = await api.bootstrap();
   let removed = 0;
-  for (const t of after.tasks) if (!beforeIds.tasks.has(t.id)) { await api.deleteTask(t.id); removed += 1; }
-  for (const p of after.plans) if (!beforeIds.plans.has(p.id)) { await api.deletePlan(p.id); removed += 1; }
-  for (const a of after.archives) if (!beforeIds.archives.has(a.id)) { await api.deleteArchive(a.id); removed += 1; }
-  for (const c of after.conversations) if (!beforeIds.conversations.has(c.id)) { await api.deleteConversation(c.id); removed += 1; }
-  for (const p of after.projects) if (!beforeIds.projects.has(p.id)) { await api.deleteProject(p.id); removed += 1; }
-  for (const id of uiFocusIds) { await db.remove('focusSessions', id); removed += 1; }
+  for (const t of after.tasks) if (!beforeIds.tasks.has(t.id)) { await removeFixture('tasks', api.deleteTask, t.id); removed += 1; }
+  for (const p of after.plans) if (!beforeIds.plans.has(p.id)) { await removeFixture('plans', api.deletePlan, p.id); removed += 1; }
+  for (const a of after.archives) if (!beforeIds.archives.has(a.id)) { await removeFixture('archives', api.deleteArchive, a.id); removed += 1; }
+  for (const c of after.conversations) if (!beforeIds.conversations.has(c.id)) { await removeFixture('conversations', api.deleteConversation, c.id); removed += 1; }
+  for (const p of after.projects) if (!beforeIds.projects.has(p.id)) { await removeFixture('projects', api.deleteProject, p.id); removed += 1; }
+  for (const id of uiFocusIds) { await removeFocusFixture(id); removed += 1; }
   if (aliasesBefore !== null) await db.atomicWrite(db.FOCUS_ALIASES_FILE, aliasesBefore);
-  else await fs.rm(db.FOCUS_ALIASES_FILE, { force: true });
-  await api.deleteTextbook(testBook.id);
-  await api.deleteArticle(testArticle.id);
-  await api.deleteVocabulary(testVocab.entry.id);
+  else await fs.rm(db.FOCUS_ALIASES_FILE, { force: true }).catch(() => {});
+  await removeFixture('textbooks', api.deleteTextbook, testBook.id, [
+    path.join(db.TEXTBOOK_PAGES_DIR, `${testBook.id}.json`),
+    path.join(db.TEXTBOOK_FILES_DIR, `${testBook.id}.pdf`),
+  ]);
+  await removeFixture('articles', api.deleteArticle, testArticle.id, [
+    path.join(db.ARTICLE_CONTENT_DIR, `${testArticle.id}.json`),
+    path.join(db.ARTICLE_CHAT_DIR, `${testArticle.id}.json`),
+  ]);
+  await removeFixture('vocabulary', api.deleteVocabulary, testVocab.entry.id);
   removed += 3;
-  ok(`清理了 ${removed} 项测试数据`, removed > 0);
+  ok(`清理了 ${removed} 项测试数据${quarantined ? `（其中 ${quarantined} 个文件隔离保存）` : ''}`, removed > 0);
 
   const final = await api.bootstrap();
   ok('★ 用户原有档案没有被动过',

@@ -118,6 +118,25 @@ async function main() {
   const undatedTask = (await req('POST', '/api/tasks', { title: '没有日期的任务' })).data.task;
   ok('可以创建没有日期的任务', undatedTask.scheduledDate === null && undatedTask.dueDate === null);
 
+  const ownedProject = (await req('POST', '/api/projects', { title: '自测 · 任务归属验证' })).data.project;
+  const ownedTask = (await req('POST', '/api/tasks', {
+    title: '归到学习项目的任务',
+    projectId: ownedProject.id,
+    source: 'ai',
+    sourceKind: 'reading',
+    sourceRefId: 'article:selftest-probe',
+    sourceLabel: '外刊 · 自测探针',
+  })).data.task;
+  ok('★ 任务可以归到学习项目', ownedTask.projectId === ownedProject.id);
+  ok('★ 阅读问答转来的待办带来源标记',
+    ownedTask.sourceKind === 'reading'
+    && ownedTask.sourceRefId === 'article:selftest-probe'
+    && ownedTask.sourceLabel === '外刊 · 自测探针');
+  ok('★ 按项目筛选能查到归属任务',
+    (await req('GET', `/api/tasks?projectId=${ownedProject.id}`)).data.tasks.some((t) => t.id === ownedTask.id));
+  await req('DELETE', `/api/tasks/${ownedTask.id}`);
+  await req('DELETE', `/api/projects/${ownedProject.id}`);
+
   const todayList = (await req('GET', '/api/tasks?filter=today')).data.tasks;
   ok('「今天」筛选包含今天安排的任务', todayList.some((t) => t.id === todayTask.id));
   ok('「今天」筛选不包含没有日期的任务', !todayList.some((t) => t.id === undatedTask.id));
@@ -1265,6 +1284,7 @@ async function main() {
   const createdTasks = confirm1.data.created;
   ok('创建的任务 source 为 ai', createdTasks.every((t) => t.source === 'ai'));
   ok('创建的任务关联了来源方案', createdTasks.every((t) => t.sourceProposalId === prop.id));
+  ok('★ 创建的任务能回溯到原对话', createdTasks.every((t) => t.sourceConversationId === conv.id));
   ok('方案状态变为已确认',
     confirm1.data.conversation.proposals.find((p) => p.id === prop.id).status === 'confirmed');
 
@@ -1539,6 +1559,35 @@ async function main() {
     ok('读取设置 → 200', s0.status === 200);
     ok('能如实读到当前引擎配置',
       ['mock', 'ollama', 'real'].includes(s0.data.aiProvider), s0.data.aiProvider);
+    ok('★ 设置里有供应商列表与模型下拉',
+      Array.isArray(s0.data.modelProviders) && Array.isArray(s0.data.modelOptions));
+    ok('★ 供应商列表也不回显 Key 明文',
+      !JSON.stringify(s0.data.modelProviders).includes('apiKey'));
+
+    const originalProviders = s0.data.modelProviders;
+    const withProbe = [
+      ...originalProviders.map((p) => ({ ...p })),
+      {
+        id: '', name: '自测供应商', type: 'openai',
+        baseUrl: 'https://example.invalid/v1',
+        models: [{ id: '', name: 'probe-a' }, { id: '', name: 'probe-b' }],
+      },
+    ];
+    const s3 = await req('PATCH', '/api/settings', { modelProviders: withProbe });
+    ok('★ 可以新增一家供应商并挂多个模型',
+      s3.status === 200 && s3.data.modelProviders.length === originalProviders.length + 1);
+    const probe = s3.data.modelProviders.find((p) => p.name === '自测供应商');
+    ok('★ 新供应商的两个模型都进下拉',
+      Boolean(probe) && probe.models.length === 2
+      && s3.data.modelOptions.some((o) => o.ref === `${probe.id}/${probe.models[1].id}`));
+    const tested = await req('POST', '/api/settings/test-model', {
+      ref: `${probe.id}/${probe.models[0].id}`,
+    });
+    ok('★ 连不上的供应商返回原因而不是 500',
+      tested.status === 200 && tested.data.ok === false && Boolean(tested.data.error));
+    await req('PATCH', '/api/settings', {
+      modelProviders: originalProviders, defaultModelRef: s0.data.defaultModelRef,
+    });
 
     const s1 = await req('PATCH', '/api/settings', { aiProvider: 'real', apiKey: 'sk-test-not-real', model: 'test-model' });
     ok('保存设置 → 200', s1.status === 200);
@@ -1567,12 +1616,51 @@ async function main() {
     await req('PATCH', '/api/settings', { aiProvider: 'mock', clearApiKey: true });
     const s2 = await req('GET', '/api/settings');
     ok('可以清掉 Key 并回到模拟引擎', s2.data.aiProvider === 'mock' && s2.data.hasApiKey === false);
+
+    const mc = await req('POST', '/api/conversations', { title: '模型选择自测' });
+    const cid = mc.data.conversation.id;
+    const badPatch = await req('PATCH', `/api/conversations/${cid}`, { modelRef: 'mp-nope/mdl-nope' });
+    ok('★ 对话不能保存不存在的模型', badPatch.status === 400);
+    const goodPatch = await req('PATCH', `/api/conversations/${cid}`, { modelRef: 'mock' });
+    ok('★ 对话可以单独选模型',
+      goodPatch.status === 200 && goodPatch.data.conversation.modelRef === 'mock');
+    const badMsg = await req('POST', `/api/conversations/${cid}/messages`, {
+      content: '测试', modelRef: 'mp-nope/mdl-nope',
+    });
+    const afterBad = await req('GET', `/api/conversations/${cid}`);
+    ok('★ 非法模型被拒时不留下孤零零的用户消息',
+      badMsg.status === 400 && afterBad.data.conversation.messages.length === 0);
+    const okMsg = await req('POST', `/api/conversations/${cid}/messages`, { content: '我今天有点乱' });
+    ok('★ 回复记录这一轮用的模型',
+      okMsg.status === 201 && okMsg.data.message.meta.modelRef === 'mock'
+      && Boolean(okMsg.data.message.meta.model));
+    await req('DELETE', `/api/conversations/${cid}`);
   } finally {
     if (settingsSnapshot !== null) await db.atomicWrite(settingsFile, settingsSnapshot);
     else await fs.rm(settingsFile, { force: true });
     // 让服务端重新读取恢复后的设置，而不是继续用测试期间的缓存
     await req('GET', '/api/ai/status?refresh=1');
   }
+
+  // ---------------------------------------------------------------- 打包地基
+  console.log('\n【打包地基 · 桌面与手机各一份数据】');
+  const contract = await req('GET', '/api/sync/contract');
+  ok('★ 同步契约可读且明确关闭',
+    contract.status === 200 && contract.data.enabled === false && Boolean(contract.data.instanceId));
+  const envelopeRes = await fetch(`${BASE}/api/export?format=json`);
+  const envelopeJson = JSON.parse(await envelopeRes.text());
+  ok('★ 导出带实例信封，原有字段不丢',
+    Boolean(envelopeJson.sync) && envelopeJson.sync.instanceId === contract.data.instanceId
+    && Array.isArray(envelopeJson.tasks));
+  for (const p of ['/manifest.webmanifest', '/sw.js', '/icon.svg', '/icons/icon-192.png', '/icons/icon-512.png']) {
+    const r = await fetch(`${BASE}${p}`);
+    ok(`★ 手机壳资源 ${p} → 200`, r.status === 200);
+  }
+  const indexHtml = await (await fetch(`${BASE}/`)).text();
+  ok('★ 首页挂了 manifest 与 SW 注册',
+    indexHtml.includes('/manifest.webmanifest') && indexHtml.includes('/sw.js'));
+  const swSrc = await fs.readFile(path.join(db.ROOT, 'public', 'sw.js'), 'utf8');
+  ok('★ Service Worker 绝不缓存 API 与 SSE', swSrc.includes("startsWith('/api/')"));
 
   // ---------------------------------------------------------------- 错误处理
   console.log('\n【错误处理与稳定性】');

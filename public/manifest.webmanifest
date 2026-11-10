@@ -1,0 +1,18 @@
+{
+  "id": "/",
+  "name": "缓一缓 · 个人学术工作台",
+  "short_name": "缓一缓",
+  "description": "安排学习任务、管理长期计划；思绪混乱时聊一聊，确认之后把有用的部分变成待办。",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f7f3ec",
+  "theme_color": "#5c4033",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

@@ -288,7 +288,7 @@ export function statusDot(task, onChange) {
 
 /** 任务条目的通用渲染 */
 export function taskRow(task, opts = {}) {
-  const { planName, onStatus, onOpen, onEdit, onDelete, showDate = true } = opts;
+  const { planName, projectName, onStatus, onOpen, onEdit, onDelete, showDate = true } = opts;
   const overdue = task.dueDate && task.dueDate < today() && task.status !== 'done';
   const important = task.priority === 'important';
 
@@ -304,7 +304,11 @@ export function taskRow(task, opts = {}) {
           ? h(`span.task-when${overdue ? '.overdue' : ''}`, { style: overdue ? { color: 'var(--alert)' } : {} }, `截止 ${fmtDay(task.dueDate)}`)
           : null,
         planName ? h('span.tag.calm', {}, planName) : null,
+        projectName ? h('span.tag.calm.task-project-tag', { title: '所属学习项目' }, projectName) : null,
         task.source === 'ai' ? h('span.tag.plain', { title: '来自 AI 建议，你确认后才创建' }, 'AI 建议') : null,
+        task.sourceLabel
+          ? h('span.tag.plain.reading-source-tag', { title: `来自 ${task.sourceLabel}` }, task.sourceLabel)
+          : null,
       ]),
     ]),
     h('div.task-actions', {}, [

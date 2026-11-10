@@ -268,9 +268,16 @@ export default async function renderArticle(root, ctx) {
     if (typeof window.requestAnimationFrame !== 'function') return;
     window.requestAnimationFrame(() => {
       if (disposed) return;
+      // 滚动发生在外层容器里（桌面壳），不是窗口
+      const host = document.getElementById('view') || document.scrollingElement;
+      if (!host) return;
       const rect = el.getBoundingClientRect();
+      const hostRect = typeof host.getBoundingClientRect === 'function'
+        ? host.getBoundingClientRect()
+        : { top: 0 };
       const ratio = Number(anchor.anchorRatio) || 0;
-      window.scrollTo({ top: Math.max(0, (window.scrollY || 0) + rect.top + rect.height * ratio - 140) });
+      const top = host.scrollTop + (rect.top - hostRect.top) + rect.height * ratio - 140;
+      host.scrollTo({ top: Math.max(0, top) });
     });
   }
 
@@ -653,6 +660,23 @@ export default async function renderArticle(root, ctx) {
 
   // ---------------------------------------------------------------- 文章问答
 
+  /** 把这条 AI 回答变成待办，带上文章来源，之后能顺着标记追回来 */
+  async function answerToTask(msg) {
+    const raw = String(msg.content || '').replace(/\s+/g, ' ').trim();
+    if (!raw) return;
+    try {
+      await api.createTask({
+        title: raw.slice(0, 60),
+        description: `来自《${detail.title}》的文章问答：\n${raw.slice(0, 500)}`,
+        source: 'ai',
+        sourceKind: 'reading',
+        sourceRefId: `article:${detail.id}`,
+        sourceLabel: `外刊 · ${detail.title}`,
+      });
+      toast('加到待办了。');
+    } catch (err) { toastError(err); }
+  }
+
   function renderChatPanel() {
     const provider = (state.settings && state.settings.aiProvider) || 'mock';
     const list = h('div.article-chat-list');
@@ -677,6 +701,14 @@ export default async function renderArticle(root, ctx) {
         isUser
           ? h('p.article-msg-text', {}, msg.content)
           : h('div.article-msg-md', {}, renderMarkdown(msg.content)),
+        isUser
+          ? null
+          : h('div.reading-to-task', {}, [
+              h('button.reader-msg-tool', {
+                type: 'button',
+                onclick: () => answerToTask(msg),
+              }, '把这条变成待办'),
+            ]),
       ]));
     }
 
@@ -832,14 +864,16 @@ export default async function renderArticle(root, ctx) {
   paintParagraphs();
   paintRail();
   restoreProgress();
-  window.addEventListener('scroll', onScroll, { passive: true });
+  // 阅读进度要跟着真正的滚动容器走（桌面壳里是 #view，不是窗口）
+  const scrollHost = document.getElementById('view') || window;
+  scrollHost.addEventListener('scroll', onScroll, { passive: true });
 
   return function cleanup() {
     disposed = true;
     clearTimeout(saveTimer);
     clearTimeout(fontTimer);
     clearTimeout(clickTimer);
-    if (typeof window.removeEventListener === 'function') window.removeEventListener('scroll', onScroll);
+    if (typeof scrollHost.removeEventListener === 'function') scrollHost.removeEventListener('scroll', onScroll);
     persistProgress();
   };
 }

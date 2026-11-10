@@ -14,6 +14,7 @@ export const state = {
   projects: [],
   archives: [],
   conversations: [],
+  nudge: null,
   settings: null,
   /** AI 引擎状态：当前 provider、实际模型名、Ollama 是否在线及模型列表 */
   ai: null,
@@ -51,6 +52,7 @@ export async function refresh() {
     projects: data.projects || [],
     archives: data.archives,
     conversations: data.conversations,
+    nudge: data.nudge || null,
     settings: data.settings,
     ai: data.ai || null,
     stats: data.stats,

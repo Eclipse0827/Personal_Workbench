@@ -1,0 +1,413 @@
+/* =========================================================================
+   桌面壳（Desktop Shell）
+   -------------------------------------------------------------------------
+   这一层只做一件事：把「整页文档」改成「固定窗口 + 栏内滚动」。
+   窗口本身永不滚动，所以换页、写操作、来消息都不会把人从当前位置甩走。
+
+   加载顺序在 style.css / workbench.css 之后，用来覆盖它们里的文档流假设。
+   ========================================================================= */
+
+html, body { height: 100%; }
+
+body {
+  overflow: hidden;                 /* 窗口不滚 */
+  overscroll-behavior: none;
+}
+
+.app {
+  height: 100dvh;
+  min-height: 100dvh;
+  align-items: stretch;
+}
+
+.sidebar {
+  height: 100%;
+  max-height: 100dvh;
+}
+
+.main {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 唯一的通用滚动区：除聊天以外的所有页面仍走这里，但滚动的是这个容器，
+   不是窗口。这样浏览器地址栏、输入法弹出都不会改变布局。 */
+#view {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-anchor: auto;
+  overscroll-behavior: contain;
+}
+
+/* 自己管滚动的页面（对话）：容器不滚，交给页面内部 */
+#view.view-fixed {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 原来底部留 96px 是为了滚到底时不贴边；现在页面在容器里滚，不需要那么厚 */
+.page { padding-bottom: 44px; }
+
+/* toast 从底部居中移到顶部居中：底部会盖住输入框 */
+.toast {
+  top: 20px;
+  bottom: auto;
+  transform: translate(-50%, -14px);
+}
+.toast.show { transform: translate(-50%, 0); }
+
+/* =========================================================================
+   对话工作区：左列表 + 右对话，主从结构
+   ========================================================================= */
+
+.cw {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  position: relative;
+}
+
+/* ---------------------------------------------------------------- 左：会话列表 */
+
+.cw-list {
+  width: 268px;
+  flex: 0 0 268px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-right: 1px solid var(--line-2);
+}
+
+.cw-list-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 14px 10px;
+}
+
+.cw-list-title {
+  font-family: var(--font-serif);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  color: var(--ink-2);
+}
+
+.cw-new {
+  margin-left: auto;
+  height: 27px;
+  padding: 0 11px;
+  font-size: 12px;
+  font-family: var(--font-sans);
+  color: var(--paper);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--r);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cw-new:hover { background: var(--accent-2); }
+
+.cw-list-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-anchor: auto;
+  overscroll-behavior: contain;
+  padding: 2px 8px 18px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+}
+
+.cw-item {
+  position: relative;
+  padding: 9px 10px 9px 11px;
+  border: 1px solid transparent;
+  border-left: 2px solid transparent;
+  border-radius: var(--r);
+  cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.cw-item + .cw-item { margin-top: 1px; }
+.cw-item:hover { background: var(--surface-2); }
+.cw-item.active {
+  background: var(--paper);
+  border-color: var(--line);
+  border-left-color: var(--accent);
+}
+
+.cw-item-title {
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-right: 18px;
+}
+.cw-item.active .cw-item-title { font-weight: 600; }
+
+.cw-item-snippet {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-4);
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cw-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+  font-family: var(--font-sans);
+  font-size: 10px;
+  color: var(--ink-4);
+}
+
+.cw-item-flag {
+  color: var(--warm);
+  background: var(--warm-soft);
+  padding: 1px 5px;
+  border-radius: 1px;
+}
+
+.cw-item-del {
+  position: absolute;
+  top: 7px;
+  right: 5px;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r);
+  color: var(--ink-4);
+  font-size: 13px;
+  opacity: 0;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.cw-item:hover .cw-item-del { opacity: 1; }
+.cw-item-del:hover { background: var(--alert-soft); color: var(--alert); }
+
+.cw-list-empty {
+  padding: 22px 12px;
+  text-align: center;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  line-height: 1.8;
+  color: var(--ink-4);
+}
+
+/* ---------------------------------------------------------------- 右：对话 */
+
+.cw-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.cw-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 22px;
+  min-height: 56px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.cw-head-main { min-width: 0; }
+.cw-head h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: .01em;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cw-head-sub {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: var(--ink-4);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cw-head-actions { margin-left: auto; display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+
+/* 消息滚动区：整个对话唯一的滚动条 */
+.cw-thread-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.cw-thread {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-anchor: auto;
+  overscroll-behavior: contain;
+  padding: 24px 0 12px;
+  scroll-behavior: auto;
+}
+
+.cw-inner {
+  max-width: 764px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.cw-end { height: 4px; }
+
+/* 提案卡底部是纵向 flex，标签/按钮默认会被拉满宽度 —— 改成靠左按内容宽度 */
+.proposal-foot > .tag,
+.proposal-foot > .btn.small {
+  align-self: flex-start;
+}
+
+/* 快捷回话容器：没有内容时不占位（否则 flex 的 gap 会多出一段空白） */
+.cw-quick:empty { display: none; }
+
+.badge-safe {
+  font-size: 10.5px; padding: 3px 9px; border-radius: var(--r-pill);
+  letter-spacing: .04em; white-space: nowrap; font-weight: 650;
+  background: var(--calm-soft); color: var(--calm);
+}
+
+/* 回到最新：浮在滚动区里，不占布局 */
+.cw-jump {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translate(-50%, 8px);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 13px;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  color: var(--paper);
+  background: var(--accent);
+  border: 0;
+  border-radius: 14px;
+  box-shadow: var(--sh-2);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .14s, transform .14s;
+  z-index: 5;
+}
+.cw-jump.on { opacity: 1; pointer-events: auto; transform: translate(-50%, 0); }
+
+/* 输入区：flex 项，不是 sticky */
+.cw-composer {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  padding: 12px 22px 13px;
+}
+
+.cw-composer-inner {
+  max-width: 764px;
+  margin: 0 auto;
+}
+
+.cw-composer .chat-composer { box-shadow: none; }
+.cw-composer .chat-composer textarea { max-height: 148px; }
+
+.cw-composer-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 7px;
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  color: var(--ink-4);
+}
+.cw-kbd {
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 2px;
+  padding: 0 3px;
+  font-size: 9.5px;
+  color: var(--ink-3);
+  background: var(--surface-2);
+}
+
+.cw-send-error {
+  margin-bottom: 8px;
+  padding: 8px 11px;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--alert);
+  background: var(--alert-soft);
+  border: 1px solid rgba(140, 59, 49, .22);
+  border-radius: var(--r);
+}
+
+/* 空状态：没选对话时，右栏交给一句提示 */
+.cw-idle {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  padding: 40px 24px;
+}
+.cw-idle-icon { font-size: 30px; color: var(--line-2); margin-bottom: 12px; }
+.cw-idle p { margin: 0 0 16px; color: var(--ink-3); font-size: 14px; }
+
+/* 侧栏开关（窄窗口时把列表变成抽屉） */
+.cw-list-toggle { display: none; }
+
+@media (max-width: 940px) {
+  .cw-list {
+    position: absolute;
+    top: 0; bottom: 0; left: 0;
+    z-index: 30;
+    width: min(300px, 84vw);
+    transform: translateX(-101%);
+    transition: transform .18s ease;
+    box-shadow: var(--sh-3);
+  }
+  .cw.show-list .cw-list { transform: none; }
+  .cw-list-toggle { display: inline-grid; }
+  .cw-scrim {
+    position: absolute;
+    inset: 0;
+    z-index: 25;
+    background: rgba(46, 37, 28, .32);
+    display: none;
+  }
+  .cw.show-list .cw-scrim { display: block; }
+  .cw-inner { padding: 0 16px; }
+  .cw-head { padding: 10px 14px; }
+  .cw-composer { padding: 10px 14px 11px; }
+}

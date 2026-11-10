@@ -1,0 +1,68 @@
+# 桌面端打包配置（electron-builder）
+# ---------------------------------------------------------------
+# 关键决定：
+#   · asar 关掉 —— 主进程要用 ELECTRON_RUN_AS_NODE 把 server/server.js 当子进程跑，
+#     文件必须真真实实躺在磁盘上，不要塞进 asar 里赌 fs 兼容性。
+#   · 只装 server/ 和 public/ —— 依赖包里没有运行时依赖（数据是 JSON 文件，
+#     没有原生模块），所以安装包体积就是 Electron 本体 + 不到 6MB 的源码。
+#   · 数据目录不在这里配置：desktop/main.js 会把它指到 %APPDATA%/huan-yihuan-desktop/data，
+#     与网页版、手机版完全隔离。
+
+appId: cn.huanyihuan.desktop
+productName: 缓一缓
+copyright: 缓一缓 · 个人学术工作台
+
+directories:
+  output: desktop-dist
+  buildResources: build
+
+# 直接用 npm 已经下好的那份 Electron，不去 GitHub 重下一遍（国内网络下那一步最容易 500）
+electronDist: node_modules/electron/dist
+
+asar: false
+
+files:
+  - package.json
+  - "!**/*.map"
+  # 整个 desktop/ 都要进包：主进程会 require float-window.js 开浮窗，
+  # 只写 main.js 的话浮窗在安装版里会因为找不到模块而失效
+  - desktop/**/*
+  - server/**/*
+  - public/**/*
+  - "!data/**/*"
+  - "!mobile/**/*"
+  - "!desktop-dist/**/*"
+  - "!scripts/**/*"
+
+extraMetadata:
+  main: desktop/main.js
+
+win:
+  # 注意：这两个 target 不要放在同一次 electron-builder 调用里跑。
+  # 一起跑时 portable 那一步会去拷 NSIS 已经清理掉的临时目录（elevate.exe），
+  # 报 ENOENT —— 文件其实都出来了，但退出码是 1。npm run desktop:pack
+  # 所以分两次调用，一次只出一个目标。
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  icon: build/icon.png
+  artifactName: HuanYiHuan-${version}-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 缓一缓
+  installerLanguages:
+    - zh_CN
+  language: "2052"
+  deleteAppDataOnUninstall: false
+
+portable:
+  artifactName: HuanYiHuan-Portable-${version}.${ext}

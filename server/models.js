@@ -69,6 +69,13 @@ function newTask(input = {}) {
     dueDate: dateOnly(input.dueDate),
     source: oneOf(input.source, TASK_SOURCE, 'manual'),
     sourceProposalId: input.sourceProposalId ? str(input.sourceProposalId, 64) : null,
+    /** 从 AI 对话里建的任务：能顺着 id 回到那次对话和那一条回复 */
+    sourceConversationId: input.sourceConversationId ? str(input.sourceConversationId, 64) : null,
+    sourceMessageId: input.sourceMessageId ? str(input.sourceMessageId, 64) : null,
+    /** 从精读 / 外刊问答一键转成的待办：记下从哪篇文章、哪本教材来 */
+    sourceKind: input.sourceKind === 'reading' ? 'reading' : null,
+    sourceRefId: input.sourceRefId ? str(input.sourceRefId, 128) : null,
+    sourceLabel: input.sourceLabel ? str(input.sourceLabel, 120) : null,
     createdAt: now,
     updatedAt: now,
     /** 只有真正完成时才有值；恢复为未完成时清回 null */
@@ -159,6 +166,18 @@ function newMessage(input = {}) {
      * 不保存完整摘要，避免把学习数据写进历史对话。
      */
     context: input.context || null,
+    /**
+     * 这一轮智能体真的动手做了什么：只留工具名、成败、一句人话摘要和
+     * 「直接建了几条待办」。用来显示「它查了 / 它建了什么」，没动手就是 null。
+     */
+    actions: Array.isArray(input.actions) && input.actions.length
+      ? input.actions.slice(0, 6).map((a) => ({
+          tool: str(a && a.tool, 40),
+          ok: Boolean(a && a.ok),
+          summary: str(a && a.summary, 300),
+          createdCount: Math.max(0, Number(a && a.createdCount) || 0),
+        }))
+      : null,
   };
 }
 
@@ -187,6 +206,8 @@ function newConversation(input = {}) {
      * 只保存选择本身；真正发送给模型的事实每轮重新构建，不写进历史消息。
      */
     context: null,
+    /** 这个对话选用的模型（providerId/modelId 或 'mock'）；null = 跟随全局默认 */
+    modelRef: input.modelRef ? str(input.modelRef, 128) : null,
   };
 }
 

@@ -193,12 +193,8 @@
 .task-row {
   display: flex; gap: 13px; align-items: flex-start;
   padding: 13px 6px 13px 13px; border-top: 1px solid var(--line);
-  border-left: 3px solid transparent;
 }
 .task-row:first-child { border-top: 0; }
-.todo-list-card .task-row { border-left-color: #c08a48; }
-.todo-list-card .task-row.important { border-left-color: #a9503a; }
-.todo-list-card .task-row.done { border-left-color: var(--line-2); }
 .task-row.done { opacity: .55; }
 .task-row.done .task-title { text-decoration: line-through; text-decoration-color: var(--ink-4); }
 .task-row.overdue .task-title { color: var(--alert); }
@@ -433,14 +429,20 @@
 
 /* ---------------------------------------------------------------- 问题梳理（展开式，不是卡片） */
 
-/* 不带边框、不带底色，只在左边加一条极细的引导线。
+/* 不带边框、不带底色，标题上方压一段短引导线。
    它更像是「聊到一半顺手整理了一下」，而不是系统吐出来的一张表单。 */
 .problem-card {
   margin: 12px 0 0 34px;
-  padding: 2px 0 2px 16px;
-  border-left: 2px solid var(--line);
+  padding: 2px 0;
   background: none;
   border-radius: 0;
+}
+.problem-card::before {
+  content: "";
+  display: block;
+  width: 42px;
+  border-top: 1px solid var(--line-2);
+  margin: 4px 0 8px;
 }
 .problem-toggle {
   display: inline-flex; align-items: center; gap: 7px;
@@ -496,8 +498,7 @@
 /* 同样是展开式：一行一句建议，右边一个「加入待办」。没有底色、没有边框。 */
 .proposal-card {
   margin: 14px 0 0 34px;
-  padding: 2px 0 2px 16px;
-  border-left: 2px solid var(--sage-soft);
+  padding: 2px 0;
   background: none; border-radius: 0;
 }
 .proposal-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; flex-wrap: wrap; }
@@ -573,7 +574,7 @@
 .archive-sub { margin: 18px 0 8px; font-weight: 700; font-size: 14.5px; }
 .archive-li { padding-left: 4px; margin-bottom: 5px; color: var(--ink-2); }
 .archive-quote {
-  border-left: 3px solid var(--line-2); padding: 4px 0 4px 16px;
+  padding: 2px 0 2px 16px;
   color: var(--ink-2); margin: 0 0 12px; white-space: pre-wrap;
 }
 .archive-gap { height: 8px; }

@@ -27,6 +27,24 @@ function stripThink(text) {
   return s.trim();
 }
 
+/** 网关出错时经常回一整页 HTML，别把它原样抛给界面 */
+function cleanErrorBody(text) {
+  return String(text || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&[a-z#0-9]+;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 140);
+}
+
+function isRetryable(status) {
+  return status === 502 || status === 503 || status === 504 || status === 429;
+}
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -72,7 +90,7 @@ async function complete({ settings, system, user, messages, temperature = 0.35, 
     }
 
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
+      const body = cleanErrorBody(await res.text().catch(() => ''));
       throw new Error(`模型接口返回 ${res.status}${body ? `：${body.slice(0, 180)}` : ''}`);
     }
     const data = await res.json();
@@ -148,4 +166,151 @@ function parseJson(text) {
   return null;
 }
 
-module.exports = { complete, parseJson, providerLabel, stripThink };
+/**
+ * 流式版本：边收边把增量交给 onDelta，最后返回完整文本。
+ * 支持 OpenAI 兼容的 SSE（data: {...}）与本机 Ollama 的 NDJSON（一行一个对象）。
+ */
+async function completeStream({ settings, system, user, messages, temperature = 0.35, maxTokens = 1600, timeoutMs = 180000, onDelta, retried = false }) {
+  const provider = settings.aiProvider;
+  const chatMessages = messages || [
+    system ? { role: 'system', content: system } : null,
+    { role: 'user', content: user },
+  ].filter(Boolean);
+
+  const emit = (piece) => {
+    if (!piece || typeof onDelta !== 'function') return;
+    try { onDelta(piece); } catch { /* 回调里出错不该打断流 */ }
+  };
+
+  if (provider === 'real') {
+    if (!settings.apiKey) throw new Error('还没有配置远程模型的 API Key');
+    const base = String(settings.baseUrl || '').replace(/\/+$/, '');
+    if (!base) throw new Error('还没有配置远程模型接口地址');
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let res;
+    try {
+      res = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.apiKey}` },
+        body: JSON.stringify({
+          model: settings.model || 'gpt-4o-mini',
+          temperature,
+          max_tokens: maxTokens,
+          stream: true,
+          messages: chatMessages,
+        }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      throw new Error(err.name === 'AbortError'
+        ? `远程模型超过 ${Math.round(timeoutMs / 1000)} 秒没有返回`
+        : `连不上远程模型：${err.message}`);
+    }
+    if (!res.ok) {
+      clearTimeout(timer);
+      const body = cleanErrorBody(await res.text().catch(() => ''));
+      // 网关偶发 502：等半秒重试一次，还不行就交给上层回退
+      if (isRetryable(res.status) && !retried) {
+        await wait(500);
+        return completeStream({ settings, system, user, messages, temperature, maxTokens, timeoutMs, onDelta, retried: true });
+      }
+      throw new Error(`模型接口返回 ${res.status}${body ? `：${body}` : ''}`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let full = '';
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith('data:')) continue;
+          const payload = t.slice(5).trim();
+          if (!payload || payload === '[DONE]') continue;
+          let piece = '';
+          try {
+            const j = JSON.parse(payload);
+            piece = j?.choices?.[0]?.delta?.content || '';
+          } catch { piece = ''; }
+          if (piece) { full += piece; emit(piece); }
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!full.trim()) throw new Error('模型返回了空内容');
+    return { text: stripThink(full), provider: 'real', model: settings.model };
+  }
+
+  if (provider === 'ollama') {
+    const base = String(settings.ollamaUrl || '').replace(/\/+$/, '');
+    const model = settings.ollamaModel;
+    if (!base || !model) throw new Error('还没有配置 Ollama');
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let res;
+    try {
+      res = await fetch(`${base}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          stream: true,
+          think: false,
+          options: { temperature, num_predict: maxTokens },
+          messages: chatMessages,
+        }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      throw new Error(err.name === 'AbortError' ? 'Ollama 超时' : `连不上 Ollama：${err.message}`);
+    }
+    if (!res.ok) {
+      clearTimeout(timer);
+      const body = cleanErrorBody(await res.text().catch(() => ''));
+      throw new Error(`Ollama 返回 ${res.status}${body ? `：${body.slice(0, 180)}` : ''}`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let full = '';
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t) continue;
+          try {
+            const j = JSON.parse(t);
+            const piece = j?.message?.content || '';
+            if (piece) { full += piece; emit(piece); }
+          } catch { /* 半行忽略 */ }
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!full.trim()) throw new Error('Ollama 返回了空内容');
+    return { text: stripThink(full), provider: 'ollama', model };
+  }
+
+  throw new Error('当前是本地规则引擎，没有可流式调用的模型');
+}
+
+module.exports = { complete, completeStream, parseJson, providerLabel, stripThink };

@@ -9,4 +9,65 @@ node_modules/
 .DS_Store
 Thumbs.db
 
+# 工具自身的记忆与缓存，不属于产品代码
+.workbuddy/
+
 data/
+
+# 自测隔离出来的测试记录与临时设置备份，不属于产品代码
+.wb-quarantine-*/
+.wb-settings-*.json
+
+# 桌面打包产物（源码 / 图标仍要提交）
+desktop-dist/
+release/
+mobile/www/
+mobile/android/
+mobile/ios/
+dist-mobile/
+*.exe
+*.dmg
+*.AppImage
+
+# 本地 npm 缓存：环境有批量删除保护，共享缓存会被拦，所以安装时指到项目内
+.npm-cache/
+
+# 手机端依赖与本机相关配置
+mobile/node_modules/
+mobile/local.properties
+
+# 安卓签名密钥与口令，只在本地保留
+mobile/keystore/
+mobile/keystore.properties
+*.keystore
+*.jks
+
+# 打包产物：单个文件超过 GitHub 100MB 上限，且随时能重新构建
+dist/
+dist-electron/
+*.apk
+*.aab
+*.zip
+*.7z
+
+# 截图 / 文档生成过程中的中间产物
+.doc-preview/
+.pip-cache/
+.demo-data/
+.tmp-test-data/
+.tmp-ui-data/
+.tmp-selftest-data/
+*.log
+
+# 本机工具留下的配置与索引，和作品代码无关
+.arts/
+.codeartsdoer/
+.vscode/
+.idea/
+
+# 误落的一层嵌套副本、以及 Windows 重定向误建的 NUL
+..Personal_Workbench-integrate/
+NUL
+
+# 一次性调试脚本
+scripts/debug-chat.js

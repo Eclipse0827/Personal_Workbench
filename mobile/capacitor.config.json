@@ -1,0 +1,22 @@
+{
+  "appId": "cn.huanyihuan.app",
+  "appName": "缓一缓",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "http",
+    "cleartext": true
+  },
+  "plugins": {
+    "Nodejs": {
+      "nodeDir": "nodejs",
+      "startMode": "auto"
+    }
+  },
+  "android": {
+    "allowMixedContent": true,
+    "backgroundColor": "#f7f3ec"
+  },
+  "ios": {
+    "contentInset": "always"
+  }
+}

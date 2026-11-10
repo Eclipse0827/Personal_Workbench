@@ -25,12 +25,16 @@ const { spawn } = require('child_process');
 
 const db = require('./db');
 const models = require('./models');
+const modelConfig = require('./model-config');
+const syncContract = require('./sync-contract');
 const projectLib = require('./projects');
 const ai = require('./ai');
 const textbook = require('./textbook');
 const articles = require('./articles');
 const articleAI = require('./article-ai');
 const contextLib = require('./context');
+const profileLib = require('./profile');
+const nudgeLib = require('./nudge');
 const {
   localDayKey,
   focusContentKey,
@@ -56,10 +60,28 @@ function argValue(name, fallback) {
 
 const PORT = Number(argValue('--port', process.env.PORT || 5180));
 const HOST = argValue('--host', '127.0.0.1');
+/**
+ * 手机端那个独立实例会暴露在局域网 / 公网上，API 现在没有用户体系，
+ * 所以至少留一道访问口令。不设这个环境变量就完全不启用，本地用法不变。
+ * 首次用 ?token=xxx 打开后会种 HttpOnly cookie，之后无需再带。
+ */
+const ACCESS_TOKEN = String(process.env.WB_ACCESS_TOKEN || '').trim();
+/** 真 App 内的 Node 运行时不支持 child_process，关掉浮窗 / 本机 OCR */
+const NATIVE_DISABLED = process.env.WB_DISABLE_NATIVE === '1';
+/** WebView 从 capacitor://localhost 跨域访问 127.0.0.1 时才开 */
+const ALLOW_CORS = process.env.WB_ALLOW_CORS === '1';
+/**
+ * 运行在桌面壳（desktop/main.js 那个 Electron 进程）里时，主进程会给出一个
+ * 只监听本机、带一次性令牌的小通道。浮窗由主进程再开一个窗口，同一个 Electron，
+ * 所以用户**不需要再装任何东西**。没有这个变量就是纯网页版，才走 spawn 那条老路。
+ */
+const SHELL_URL = String(process.env.WB_DESKTOP_SHELL_URL || '').trim().replace(/\/+$/, '');
+const SHELL_TOKEN = String(process.env.WB_DESKTOP_SHELL_TOKEN || '');
 
 // ---------------------------------------------------------------- HTTP 工具
 
 const MIME = {
+  '.webmanifest': 'application/manifest+json',
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
@@ -71,6 +93,34 @@ const MIME = {
   '.ico': 'image/x-icon',
   '.txt': 'text/plain; charset=utf-8',
 };
+
+function cookieValue(header, name) {
+  for (const part of String(header || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() !== name) continue;
+    try { return decodeURIComponent(part.slice(i + 1).trim()); } catch { return ''; }
+  }
+  return '';
+}
+
+/** 只有设置了 WB_ACCESS_TOKEN 才生效；静态页、API、SSE 一视同仁 */
+function authorize(req, res, url) {
+  if (!ACCESS_TOKEN) return true;
+  const bearer = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  const provided = bearer
+    || cookieValue(req.headers.cookie, 'wb_token')
+    || url.searchParams.get('token');
+  if (provided !== ACCESS_TOKEN) {
+    sendText(res, 401, '需要访问口令：在地址后面加 ?token=你的口令 打开一次即可。');
+    return false;
+  }
+  if (!cookieValue(req.headers.cookie, 'wb_token')) {
+    res.setHeader('Set-Cookie',
+      `wb_token=${encodeURIComponent(ACCESS_TOKEN)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`);
+  }
+  return true;
+}
 
 function sendJson(res, status, data) {
   const body = JSON.stringify(data);
@@ -90,8 +140,14 @@ function sendText(res, status, text, type = 'text/plain; charset=utf-8', extra =
 function fail(res, err) {
   const status = err && err.status ? err.status : 500;
   if (status >= 500) console.error('[错误]', err);
-  const body = { error: (err && err.message) || '服务器内部错误' };
-  if (err && err.code) body.code = String(err.code);
+  const raw = (err && err.message) || '服务器内部错误';
+  // 文件系统 / 沙箱守卫的内部错误不要把原文贴到界面上，用户既看不懂也帮不上忙
+  const internal = status >= 500
+    && /\[safe-delete\]|SAFE_DELETE_|EACCES|EPERM|ENOENT|ENOSPC|EIO|EBUSY|EEXIST/i.test(raw);
+  const body = {
+    error: internal ? '操作没完成：服务端遇到内部限制，详细原因已记在服务端日志里。' : raw,
+  };
+  if (!internal && err && err.code) body.code = String(err.code);
   sendJson(res, status, body);
 }
 
@@ -623,6 +679,14 @@ async function handleConversations(req, res, seg, query) {
           updatedAt: db.nowIso(),
         };
       }
+      if (body.modelRef !== undefined) {
+        const ref = body.modelRef === null ? null : String(body.modelRef);
+        if (ref !== null && !modelConfig.isValidRef(await db.getSettings(), ref)) {
+          throw badRequest('这个模型配置已经不在了，去设置里重新选一个');
+        }
+        // null 表示「跟随全局默认」，不是把某一轮的选择写死
+        conv.modelRef = ref;
+      }
       await db.put('conversations', conv);
       return sendJson(res, 200, { conversation: conv });
     }
@@ -656,18 +720,78 @@ async function handleConversations(req, res, seg, query) {
   // 发消息
   if (seg.length === 4 && seg[3] === 'messages' && method === 'POST') {
     const body = await readBody(req);
-    const text = String(body.content || '').trim();
-    if (!text) throw badRequest('说点什么吧，一句话就行');
+    const retry = body.retry === true;
+    let text = String(body.content || '').trim();
+    if (!retry && !text) throw badRequest('说点什么吧，一句话就行');
 
     const conv = await db.get('conversations', id);
-    conv.messages.push(models.newMessage({ role: 'user', content: text, provider: 'mock' }));
 
-    // 首条用户消息用来给对话取标题
-    if (conv.messages.filter((m) => m.role === 'user').length === 1) {
-      conv.title = text.replace(/\s+/g, ' ').slice(0, 40) || '新的对话';
+    // 模型必须在「先把用户这句话落库」之前校验完：否则配置不合法被拒时，
+    // 会留下一条永远等不到回复的孤消息。
+    // 优先级：本轮请求 > 对话保存的选择 > 全局默认；前端不能凭空塞一个地址。
+    const settings = await db.getSettings();
+    const requestedRef = typeof body.modelRef === 'string' && body.modelRef
+      ? body.modelRef
+      : (conv.modelRef || settings.defaultModelRef);
+    if (typeof body.modelRef === 'string' && body.modelRef
+      && !modelConfig.isValidRef(settings, body.modelRef)) {
+      throw badRequest('这个模型配置已经不在了，去设置里重新选一个');
+    }
+    const picked = modelConfig.resolve(settings, requestedRef);
+    const effectiveSettings = picked.settings;
+
+    let userMsg;
+    if (retry) {
+      // 重新生成：不新增问题，把上一轮的答复撤掉再重写一遍
+      const lastUser = [...conv.messages].reverse().find((m) => m.role === 'user');
+      if (!lastUser) throw badRequest('这个对话里还没有可以重答的问题');
+      text = String(lastUser.content || '');
+      userMsg = lastUser;
+      const tail = conv.messages[conv.messages.length - 1];
+      if (tail && tail.role === 'assistant') {
+        conv.messages.pop();
+        // 它可能挂着一份还没确认的方案，一起撤掉，别留在列表里
+        if (tail.proposalId) {
+          const pi = conv.proposals.findIndex((p) => p.id === tail.proposalId && p.status === 'pending');
+          if (pi >= 0) conv.proposals.splice(pi, 1);
+        }
+      }
+    } else {
+      userMsg = models.newMessage({ role: 'user', content: text, provider: 'mock' });
+      conv.messages.push(userMsg);
+      // 首条用户消息用来给对话取标题
+      if (conv.messages.filter((m) => m.role === 'user').length === 1) {
+        conv.title = text.replace(/\s+/g, ' ').slice(0, 40) || '新的对话';
+      }
     }
 
-    const settings = await db.getSettings();
+    // 先把这句话存下来，再去叫模型：一轮要跑几秒到几十秒，
+    // 这期间用户完全可能切到别的页面。先存住，回来时至少看得到自己刚说的话。
+    await db.put('conversations', conv);
+
+    // effectiveSettings 已在落库前按对话选好的模型解析好了
+    // 流式：客户端带 ?stream=1 时改成 SSE，边生成边推；否则还是原来的一次性 JSON
+    const useStream = /[?&]stream=1/.test(req.url || '') || body.stream === true;
+    let sseOpen = false;
+    let clientGone = false;
+    // 客户端断开（点了停止、关了页面）就别再往下烧模型了
+    if (useStream) res.on('close', () => { clientGone = true; });
+    const sse = (obj) => {
+      if (!sseOpen || res.writableEnded) return;
+      try { res.write(`data: ${JSON.stringify(obj)}
+
+`); } catch { /* 客户端断开就算了 */ }
+    };
+    if (useStream) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      sseOpen = true;
+      sse({ type: 'open', userMessage: userMsg });
+    }
 
     // 每轮都按保存的选择重新构建真实上下文；历史里只存最小快照
     let builtContext = null;
@@ -680,7 +804,24 @@ async function handleConversations(req, res, seg, query) {
       }
     }
 
-    const result = await ai.respond({ conversation: conv, userText: text, settings, context: builtContext });
+    let result;
+    try {
+      result = useStream
+        ? await ai.respondStream({
+          conversation: conv, userText: text, settings: effectiveSettings, context: builtContext, onEvent: sse,
+          shouldStop: () => clientGone,
+        })
+        : await ai.respond({ conversation: conv, userText: text, settings: effectiveSettings, context: builtContext });
+    } catch (err) {
+      if (useStream) {
+        // 用户自己点的停止：连接多半已经断了，也不用再回一条错误
+        if (!err || !err.stopped) sse({ type: 'error', error: err.message || String(err) });
+        res.end();
+        return;
+      }
+      if (err && err.stopped) throw Object.assign(new Error('已停止生成'), { status: 400 });
+      throw err;
+    }
 
     let proposalId = null;
     if (result.proposal) {
@@ -701,7 +842,8 @@ async function handleConversations(req, res, seg, query) {
       problemCard: result.problemCard,
       proposalId,
       provider: result.provider,
-      meta: result.meta || null,
+      meta: { ...(result.meta || {}), model: picked.modelName, modelRef: picked.ref },
+      actions: result.actions || null,
       context: builtContext ? contextLib.snapshotContext(builtContext) : null,
     });
     conv.messages.push(assistantMsg);
@@ -712,12 +854,22 @@ async function handleConversations(req, res, seg, query) {
     // 记住「正在等用户回答哪个问题、当时想做什么」，下一轮才不会丢掉上下文
     if (result.pendingIntent !== undefined) conv.pendingIntent = result.pendingIntent;
 
+    // 生成要几十秒，这期间用户可能已经把对话删了。
+    // 直接 put 会把删掉的对话又写回来 —— 先确认它还在。
+    const alive = await db.getOrNull('conversations', id);
+    if (!alive) {
+      if (useStream) { sse({ type: 'gone' }); res.end(); return; }
+      throw Object.assign(new Error('这个对话在生成期间被删掉了'), { status: 404 });
+    }
+
     await db.put('conversations', conv);
-    return sendJson(res, 201, {
-      conversation: conv,
-      message: assistantMsg,
-      warning: [result.warning, contextWarning].filter(Boolean).join(' ') || null,
-    });
+    const warning = [result.warning, contextWarning].filter(Boolean).join(' ') || null;
+    if (useStream) {
+      sse({ type: 'done', conversation: conv, message: assistantMsg, warning });
+      res.end();
+      return;
+    }
+    return sendJson(res, 201, { conversation: conv, message: assistantMsg, warning });
   }
 
   // 编辑某一轮的问题梳理卡（用户可以随时纠正 AI 的理解）
@@ -730,13 +882,72 @@ async function handleConversations(req, res, seg, query) {
 
     const card = msg.problemCard;
     for (const field of ['expressed', 'unknowns', 'directions', 'nextSteps']) {
-      if (Array.isArray(body[field])) card[field] = body[field].map((x) => String(x)).filter((x) => x.trim());
+      if (Array.isArray(body[field])) {
+        card[field] = body[field].slice(0, 8)
+          .map((x) => String(x).trim().slice(0, 300))
+          .filter((x) => x);
+      }
     }
-    if (typeof body.summary === 'string') card.summary = body.summary;
+    if (typeof body.summary === 'string') card.summary = body.summary.trim().slice(0, 1000);
     if (body.emotion === null) card.emotion = null;
     msg.editedByUser = true;
     await db.put('conversations', conv);
     return sendJson(res, 200, { conversation: conv });
+  }
+
+  // 梳理卡里的「下一步」→ 正式待办。
+  // 用户点「加入待办」本身就是确认，所以这一步不再过方案卡；
+  // 但只认这张卡里真实存在的条目，且重复点不会生成第二个任务。
+  if (seg.length === 6 && seg[3] === 'messages' && seg[5] === 'next-steps' && method === 'POST') {
+    const body = await readBody(req);
+    const conv = await db.get('conversations', id);
+    const msg = conv.messages.find((m) => m.id === seg[4]);
+    if (!msg) throw Object.assign(new Error('找不到这条消息'), { status: 404 });
+    const card = msg.problemCard;
+    if (!card) throw badRequest('这条消息没有整理卡');
+
+    const allowed = new Set((card.nextSteps || []).map((x) => String(x)));
+    const wanted = [...new Set((Array.isArray(body.steps) ? body.steps : []).map(String))]
+      .filter((s) => allowed.has(s)).slice(0, 8);
+    if (!wanted.length) throw badRequest('没有选中可以加入待办的下一步');
+
+    if (!Array.isArray(card.stepTasks)) card.stepTasks = [];
+    const allTasks = await db.list('tasks');
+    const created = [];
+    const skipped = [];
+
+    for (const step of wanted) {
+      const rec = card.stepTasks.find((x) => x && x.title === step && x.taskId);
+      const already = rec
+        ? allTasks.find((t) => t.id === rec.taskId)
+        : allTasks.find((t) => t.sourceMessageId === msg.id && t.title === step);
+      if (already) {
+        const idx = card.stepTasks.findIndex((x) => x && x.title === step);
+        const entry = { title: step, taskId: already.id, createdAt: (rec && rec.createdAt) || db.nowIso() };
+        if (idx >= 0) card.stepTasks[idx] = entry; else card.stepTasks.push(entry);
+        skipped.push({ step, taskId: already.id, reason: '已经在待办里了' });
+        continue;
+      }
+
+      const task = models.newTask({
+        title: step.slice(0, 200),
+        description: '从 AI 对话里梳理出来的下一步。',
+        status: 'todo',
+        priority: 'normal',
+        source: 'ai',
+        sourceConversationId: conv.id,
+        sourceMessageId: msg.id,
+      });
+      await db.put('tasks', task);
+      allTasks.push(task);
+      const idx = card.stepTasks.findIndex((x) => x && x.title === step);
+      const entry = { title: step, taskId: task.id, createdAt: db.nowIso() };
+      if (idx >= 0) card.stepTasks[idx] = entry; else card.stepTasks.push(entry);
+      created.push(task);
+    }
+
+    await db.put('conversations', conv);
+    return sendJson(res, 200, { conversation: conv, created, skipped });
   }
 
   // 编辑待确认方案里的建议行动
@@ -791,6 +1002,8 @@ async function handleConversations(req, res, seg, query) {
       if (!plan) throw badRequest('找不到要关联的计划');
     }
 
+    // 记住这次待办是从哪条回复来的，任务详情/回溯才能回到原对话
+    const sourceMessage = (conv.messages || []).find((m) => m.proposalId === prop.id);
     const created = [];
     const skipped = [];
     for (const action of wanted) {
@@ -822,6 +1035,8 @@ async function handleConversations(req, res, seg, query) {
         dueDate: action.dueDate,
         source: 'ai',
         sourceProposalId: prop.id,
+        sourceConversationId: conv.id,
+        sourceMessageId: sourceMessage ? sourceMessage.id : null,
       });
       await db.put('tasks', task);
       action.createdTaskId = task.id;
@@ -1830,12 +2045,69 @@ async function buildAiStatus({ force = false } = {}) {
 
 // ---------------------------------------------------------------- 桌面浮窗
 
+/** 打一声招呼给桌面壳的小通道，让它替我开窗口 */
+function askShell(pathname) {
+  return new Promise((resolve, reject) => {
+    let target;
+    try {
+      target = new URL(SHELL_URL + pathname);
+    } catch {
+      reject(Object.assign(new Error('桌面壳地址不正确'), { status: 500 }));
+      return;
+    }
+    const req = http.request({
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname,
+      method: 'POST',
+      headers: { 'x-wb-shell': SHELL_TOKEN, 'content-length': 0 },
+      timeout: 10000,
+    }, (res) => {
+      let buf = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { buf += chunk; });
+      res.on('end', () => {
+        let body = null;
+        try { body = JSON.parse(buf); } catch { /* 空响应也能接受 */ }
+        if (res.statusCode === 200 && (!body || body.ok !== false)) {
+          resolve(body || { ok: true });
+          return;
+        }
+        reject(Object.assign(
+          new Error((body && body.message) || '桌面窗口没有开起来，可以再点一次试试。'),
+          { status: 502 }
+        ));
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('桌面壳没有响应')));
+    req.on('error', (err) => {
+      reject(Object.assign(new Error(`连不上桌面窗口：${err.message}`), { status: 502 }));
+    });
+    req.end();
+  });
+}
+
 /**
  * 打开真正的桌面浮窗。
- * Electron 只是一个可选的桌面外壳：没装的时候网页端照常使用，
- * 这里会如实告诉用户需要先安装，而不是假装窗口已经弹出来了。
+ *
+ * 分两种情况：
+ *   1. 在桌面 App 里 —— 让主进程在同一个 Electron 进程里再开一个窗口。
+ *      这是正常路径，不需要用户安装任何额外的东西。
+ *   2. 在浏览器里用网页版 —— 本机确实没有 Electron 外壳，只能如实告诉用户
+ *      需要装一次（或直接用桌面版），不假装窗口已经弹出来了。
  */
-function launchFloatWindow() {
+async function launchFloatWindow() {
+  if (NATIVE_DISABLED) {
+    throw Object.assign(new Error('手机版没有桌面浮窗，这个功能只在电脑上可用。'), { status: 400 });
+  }
+
+  const url = `http://${HOST}:${activePort}`;
+
+  if (SHELL_URL) {
+    await askShell('/float/open');
+    return { ok: true, url, shell: true };
+  }
+
   let electronPath = null;
   try {
     // 只检查已下载的可执行文件，绝不在请求里触发 Electron 的二次下载（那会把服务卡住）
@@ -1843,13 +2115,12 @@ function launchFloatWindow() {
   } catch { /* 没装就是没装 */ }
   if (!electronPath) {
     throw Object.assign(
-      new Error('桌面浮窗需要 Electron。先在这个目录运行：npm install --save-dev electron'),
+      new Error('网页版没有桌面外壳。想要浮窗可以直接用桌面版，或在本机装一次 Electron。'),
       { status: 501, code: 'ELECTRON_NOT_INSTALLED' }
     );
   }
 
   const main = path.join(db.ROOT, 'desktop', 'float-main.js');
-  const url = `http://${HOST}:${activePort}`;
   const startElectron = (extra) => {
     const child = spawn(electronPath, [...extra, main, `--url=${url}`], {
       cwd: db.ROOT,
@@ -2139,11 +2410,13 @@ async function handleApi(req, res, pathname, query) {
   const method = req.method.toUpperCase();
   const seg = pathname.split('/').filter(Boolean); // ['api', ...]
 
+
   if (seg[1] === 'bootstrap' && method === 'GET') {
-    const [overview, settings, aiStatus] = await Promise.all([
+    const [overview, settings, aiStatus, nudge] = await Promise.all([
       buildOverview(), db.getPublicSettings(), buildAiStatus(),
+      nudgeLib.build().catch(() => null),
     ]);
-    return sendJson(res, 200, { ...overview, settings, ai: aiStatus });
+    return sendJson(res, 200, { ...overview, settings, ai: aiStatus, nudge });
   }
 
   if (seg[1] === 'ai' && seg[2] === 'status' && method === 'GET') {
@@ -2157,11 +2430,40 @@ async function handleApi(req, res, pathname, query) {
   if (seg[1] === 'archives') return handleArchives(req, res, seg, query);
   if (seg[1] === 'focus') return handleFocus(req, res, seg);
   if (seg[1] === 'float' && seg[2] === 'launch' && method === 'POST') {
-    return sendJson(res, 202, launchFloatWindow());
+    return sendJson(res, 202, await launchFloatWindow());
   }
   if (seg[1] === 'textbooks') return handleTextbooks(req, res, seg, query);
   if (seg[1] === 'articles') return handleArticles(req, res, seg, query);
   if (seg[1] === 'vocabulary') return handleVocabulary(req, res, seg);
+
+  // 长期记忆：只读列表 + 一键清空（清空是用户主动点的，不交给模型）
+  if (seg[1] === 'profile') {
+    if (method === 'GET') return sendJson(res, 200, { items: await profileLib.list() });
+    if (method === 'DELETE') return sendJson(res, 200, await profileLib.clear());
+  }
+  // 测试某家供应商能不能连上、有哪些模型。只在这一个请求里用 Key，不落盘、不回显。
+  if (seg[1] === 'settings' && seg[2] === 'test-model' && method === 'POST') {
+    const body = await readBody(req);
+    const s = await db.getSettings();
+    let target = null;
+    if (typeof body.ref === 'string') {
+      const [pid] = body.ref.split('/');
+      target = (s.modelProviders || []).find((p) => p.id === pid) || null;
+    } else if (body.provider && typeof body.provider === 'object') {
+      const p = body.provider;
+      const saved = (s.modelProviders || []).find((x) => x.id === p.id);
+      target = {
+        type: p.type === 'ollama' ? 'ollama' : 'openai',
+        baseUrl: String(p.baseUrl || ''),
+        // 表单里没重新填 Key 时，用已保存的那把；前端永远拿不到明文
+        apiKey: typeof p.apiKey === 'string' && p.apiKey.trim()
+          ? p.apiKey.trim()
+          : (saved ? saved.apiKey : ''),
+      };
+    }
+    if (!target) throw badRequest('没有可测试的模型配置');
+    return sendJson(res, 200, await modelConfig.testProvider(target));
+  }
 
   if (seg[1] === 'settings') {
     if (method === 'GET') return sendJson(res, 200, await db.getPublicSettings());
@@ -2172,6 +2474,11 @@ async function handleApi(req, res, pathname, query) {
       aiStatusCache = { at: 0, value: null };
       return sendJson(res, 200, next);
     }
+  }
+
+  // 未来数据互通的只读契约：现在明确返回 enabled=false
+  if (seg[1] === 'sync' && seg[2] === 'contract' && method === 'GET') {
+    return sendJson(res, 200, syncContract.describe(db.instanceId()));
   }
 
   if (seg[1] === 'stats' && method === 'GET') {
@@ -2194,13 +2501,16 @@ async function handleApi(req, res, pathname, query) {
       });
     }
 
-    // JSON 导出绝不包含 API Key
-    const payload = {
-      exportedAt: db.nowIso(),
-      app: '缓一缓',
-      version: 3,
-      plans, tasks, projects, conversations, archives,
-    };
+    // JSON 导出绝不包含 API Key；外层加同步信封，原来那些字段一个不少
+    const payload = syncContract.envelope({
+      instanceId: db.instanceId(),
+      collections: {
+        exportedAt: db.nowIso(),
+        app: '缓一缓',
+        version: 3,
+        plans, tasks, projects, conversations, archives,
+      },
+    });
     return sendText(res, 200, JSON.stringify(payload, null, 2), 'application/json; charset=utf-8', {
       'Content-Disposition': `attachment; filename="huan-yi-huan-${stamp}.json"`,
     });
@@ -2216,6 +2526,15 @@ const server = http.createServer(async (req, res) => {
   const pathname = url.pathname;
 
   try {
+    // Capacitor WebView 的 origin 是 capacitor://localhost，
+    // 它请求 App 内 127.0.0.1 的 Node 服务属于跨域，这里放行（默认关闭）。
+    if (ALLOW_CORS) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Cookie, Authorization');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+      if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+    }
+    if (!authorize(req, res, url)) return;
     if (pathname === '/api' || pathname.startsWith('/api/')) {
       await handleApi(req, res, pathname, url.searchParams);
       return;
